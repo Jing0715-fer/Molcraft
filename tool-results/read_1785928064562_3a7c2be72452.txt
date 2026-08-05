@@ -1,0 +1,2002 @@
+     1→/**
+     2→ * Local bioinformatics CLI registry + probe + analysis recipes.
+     3→ *
+     4→ * Pattern adapted from https://github.com/Jing0717-fer/pdb-tracker-web-v4/
+     5→ * (src/lib/llm.ts `CLI_ADAPTERS`): each adapter declares a binary name and
+     6→ * smoke-test args; `probeCli` runs `which` + the smoke test and caches the
+     7→ * result for the lifetime of the process.
+     8→ *
+     9→ * Analysis recipes are Python scripts that use the probed CLIs (biopython,
+    10→ * freesasa, pdb-tools) to compute real structural data: distances, interface
+    11→ * residues, SASA/BSA, secondary structure, disulfide bonds, etc.
+    12→ */
+    13→
+    14→import { execFile } from "node:child_process";
+    15→import { promisify } from "node:util";
+    16→
+    17→const execFileAsync = promisify(execFile);
+    18→
+    19→export interface CliAdapter {
+    20→  id: string;
+    21→  label: string;
+    22→  category: "python" | "binary" | "pymol";
+    23→  bin: string;
+    24→  /** Smoke-test args — must exit 0 and ideally print a version string. */
+    25→  probeArgs: string[];
+    26→  /** A short description of what this tool does, shown in the UI. */
+    27→  description: string;
+    28→  /** Capabilities this tool provides (used by the LLM to know what it can ask for). */
+    29→  capabilities: string[];
+    30→}
+    31→
+    32→export const CLI_ADAPTERS: CliAdapter[] = [
+    33→  {
+    34→    id: "biopython",
+    35→    label: "Biopython",
+    36→    category: "python",
+    37→    bin: "python3",
+    38→    probeArgs: ["-c", "import Bio; print(Bio.__version__)"],
+    39→    description: "Python 生物信息库 — PDB/mmCIF 解析、距离计算、DSSP、序列操作",
+    40→    capabilities: [
+    41→      "parse PDB / mmCIF file",
+    42→      "compute atom-atom / residue-residue distances",
+    43→      "extract chain / residue / atom lists",
+    44→      "run DSSP secondary structure assignment (if mkdssp binary available)",
+    45→      "interface residue detection by distance cutoff",
+    46→      "NeighborSearch for contact detection",
+    47→    ],
+    48→  },
+    49→  {
+    50→    id: "pdb-tools",
+    51→    label: "pdb-tools",
+    52→    category: "binary",
+    53→    bin: "pdb_tidy",
+    54→    probeArgs: [],
+    55→    description: "PDB 文件操作 CLI 套件 — pdb_tidy, pdb_selchain, pdb_reres, etc.",
+    56→    capabilities: [
+    57→      "select chains (pdb_selchain)",
+    58→      "renumber residues (pdb_reres)",
+    59→      "tidy PDB formatting (pdb_tidy)",
+    60→      "select residues by range (pdb_selres)",
+    61→      "extract ligands (pdb_selhetatm)",
+    62→    ],
+    63→  },
+    64→  {
+    65→    id: "freesasa",
+    66→    label: "FreeSASA",
+    67→    category: "python",
+    68→    bin: "python3",
+    69→    probeArgs: ["-c", "import freesasa; print('ok')"],
+    70→    description: "溶剂可及表面积 (SASA) 计算 — 单链 SASA、复合物 SASA、 buried SASA",
+    71→    capabilities: [
+    72→      "compute total / per-residue SASA",
+    73→      "compute per-chain SASA",
+    74→      "identify surface-exposed vs buried residues",
+    75→    ],
+    76→  },
+    77→  {
+    78→    id: "numpy",
+    79→    label: "NumPy",
+    80→    category: "python",
+    81→    bin: "python3",
+    82→    probeArgs: ["-c", "import numpy; print(numpy.__version__)"],
+    83→    description: "数值计算 — 用于坐标运算、距离矩阵、几何分析",
+    84→    capabilities: [
+    85→      "coordinate array operations",
+    86→      "distance matrix computation",
+    87→      "RMSD calculation",
+    88→    ],
+    89→  },
+    90→  {
+    91→    id: "pymol",
+    92→    label: "PyMOL",
+    93→    category: "pymol",
+    94→    bin: "pymol",
+    95→    probeArgs: ["-c", "-q"],
+    96→    description: "PyMOL 命令行 — 高级结构分析、脚本化测量、RMSD、interface residues",
+    97→    capabilities: [
+    98→      "interface residues (cmd.interfaceResidues)",
+    99→      "RMSD alignment (cmd.align, cmd.super)",
+   100→      "distance measurements (cmd.distance)",
+   101→      "secondary structure (cmd.dss)",
+   102→    ],
+   103→  },
+   104→  {
+   105→    id: "dssp",
+   106→    label: "DSSP / mkdssp",
+   107→    category: "binary",
+   108→    bin: "mkdssp",
+   109→    probeArgs: ["--version"],
+   110→    description: "二级结构分配 (DSSP 算法) — α-helix, β-sheet, loop, 3_10-helix",
+   111→    capabilities: [
+   112→      "assign secondary structure",
+   113→      "solvent accessible surface area per residue",
+   114→      "hydrogen bond detection",
+   115→    ],
+   116→  },
+   117→];
+   118→
+   119→export interface CliProbeResult {
+   120→  id: string;
+   121→  label: string;
+   122→  category: string;
+   123→  available: boolean;
+   124→  version?: string;
+   125→  bin: string;
+   126→  description: string;
+   127→  capabilities: string[];
+   128→  error?: string;
+   129→}
+   130→
+   131→// In-process cache so we don't re-probe on every request.
+   132→let cache: CliProbeResult[] | null = null;
+   133→let cacheTime = 0;
+   134→const CACHE_TTL_MS = 60_000; // 1 min
+   135→
+   136→async function probeOne(adapter: CliAdapter): Promise<CliProbeResult> {
+   137→  const base: CliProbeResult = {
+   138→    id: adapter.id,
+   139→    label: adapter.label,
+   140→    category: adapter.category,
+   141→    available: false,
+   142→    bin: adapter.bin,
+   143→    description: adapter.description,
+   144→    capabilities: adapter.capabilities,
+   145→  };
+   146→
+   147→  try {
+   148→    if (adapter.category === "binary") {
+   149→      try {
+   150→        await execFileAsync("which", [adapter.bin], { timeout: 3000 });
+   151→      } catch {
+   152→        return { ...base, error: "binary not in PATH" };
+   153→      }
+   154→      if (adapter.probeArgs.length > 0) {
+   155→        try {
+   156→          const { stdout } = await execFileAsync(adapter.bin, adapter.probeArgs, {
+   157→            timeout: 5000,
+   158→            maxBuffer: 1024 * 64,
+   159→          });
+   160→          const version = stdout.trim().split("\n")[0].slice(0, 80);
+   161→          return { ...base, available: true, version };
+   162→        } catch {
+   163→          return { ...base, available: true, version: "ok" };
+   164→        }
+   165→      }
+   166→      return { ...base, available: true };
+   167→    }
+   168→
+   169→    if (adapter.category === "python") {
+   170→      const { stdout } = await execFileAsync(
+   171→        adapter.bin,
+   172→        adapter.probeArgs,
+   173→        { timeout: 5000, maxBuffer: 1024 * 64 }
+   174→      );
+   175→      const version = stdout.trim().split("\n")[0].slice(0, 80);
+   176→      return { ...base, available: true, version };
+   177→    }
+   178→
+   179→    if (adapter.category === "pymol") {
+   180→      try {
+   181→        await execFileAsync("which", [adapter.bin], { timeout: 3000 });
+   182→        return { ...base, available: true, version: "ok" };
+   183→      } catch {
+   184→        return { ...base, error: "pymol not in PATH" };
+   185→      }
+   186→    }
+   187→
+   188→    return base;
+   189→  } catch (err) {
+   190→    return {
+   191→      ...base,
+   192→      error: err instanceof Error ? err.message : String(err),
+   193→    };
+   194→  }
+   195→}
+   196→
+   197→export async function probeAllClis(force = false): Promise<CliProbeResult[]> {
+   198→  if (cache && !force && Date.now() - cacheTime < CACHE_TTL_MS) {
+   199→    return cache;
+   200→  }
+   201→  const results = await Promise.all(CLI_ADAPTERS.map(probeOne));
+   202→  cache = results;
+   203→  cacheTime = Date.now();
+   204→  return results;
+   205→}
+   206→
+   207→// ============================================================
+   208→// Analysis Recipes — Python scripts that produce real structural data
+   209→// ============================================================
+   210→
+   211→export interface AnalysisRecipe {
+   212→  id: string;
+   213→  label: string;
+   214→  description: string;
+   215→  /** Python libraries required (any must be available). */
+   216→  requires: string[];
+   217→  /** Parameter names the recipe accepts (besides the input file). */
+   218→  params: Array<{
+   219→    name: string;
+   220→    type: "string" | "number" | "string[]";
+   221→    required: boolean;
+   222→    description: string;
+   223→  }>;
+   224→  /** Returns a Python script body. `inputPath` is the local file path, `params` includes `__format__`. */
+   225→  buildScript: (inputPath: string, params: Record<string, unknown>) => string;
+   226→}
+   227→
+   228→/**
+   229→ * Shared header for all recipes — picks the right Biopython parser based on
+   230→ * the file format (PDB or mmCIF) and exposes a `load_structure(path)` helper.
+   231→ */
+   232→const RECIPE_HEADER = `
+   233→import json, sys, os
+   234→def load_structure(path):
+   235→    fmt = path.rsplit('.', 1)[-1].lower()
+   236→    if fmt == 'cif':
+   237→        from Bio.PDB.MMCIFParser import MMCIFParser
+   238→        parser = MMCIFParser(QUIET=True)
+   239→    else:
+   240→        from Bio.PDB import PDBParser
+   241→        parser = PDBParser(QUIET=True)
+   242→    return parser.get_structure('s', path)
+   243→`;
+   244→
+   245→export const ANALYSIS_RECIPES: AnalysisRecipe[] = [
+   246→  {
+   247→    id: "summary",
+   248→    label: "结构摘要",
+   249→    description: "输出结构基本统计：链数、残基数、原子数、配体列表",
+   250→    requires: ["biopython"],
+   251→    params: [],
+   252→    buildScript: (inputPath) => `${RECIPE_HEADER}
+   253→from collections import Counter
+   254→struct = load_structure("${inputPath}")
+   255→try:
+   256→    model = next(iter(struct))
+   257→except StopIteration:
+   258→    print(json.dumps({"error": "no models"})); raise SystemExit
+   259→chains = list(model)
+   260→residues = list(model.get_residues())
+   261→atoms = list(model.get_atoms())
+   262→het_res = [r for r in residues if r.id[0].strip() != "" and r.resname != "HOH"]
+   263→ligands = Counter(r.resname for r in het_res)
+   264→chain_summary = {}
+   265→for c in chains:
+   266→    cr = [r for r in c if r.id[0].strip() == ""]
+   267→    chain_summary[c.id] = {
+   268→        "residue_count": len(cr),
+   269→        "first_resno": cr[0].id[1] if cr else None,
+   270→        "last_resno": cr[-1].id[1] if cr else None,
+   271→        "atom_count": len(list(c.get_atoms())),
+   272→    }
+   273→print(json.dumps({
+   274→    "chain_count": len(chains),
+   275→    "chains": chain_summary,
+   276→    "total_residues": len(residues),
+   277→    "total_atoms": len(atoms),
+   278→    "ligands": dict(ligands),
+   279→    "has_hydrogens": any(a.element == "H" for a in atoms),
+   280→}, ensure_ascii=False, indent=2))
+   281→`,
+   282→  },
+   283→  {
+   284→    id: "distances",
+   285→    label: "原子/残基距离",
+   286→    description: "计算任意两个原子之间的距离 (Å)",
+   287→    requires: ["biopython"],
+   288→    params: [
+   289→      {
+   290→        name: "pairs",
+   291→        type: "string[]",
+   292→        required: true,
+   293→        description: '距离对，格式 "chain resno atom" 或 "chain resno" (取 CA)',
+   294→      },
+   295→    ],
+   296→    buildScript: (inputPath, params) => {
+   297→      const pairs = JSON.stringify(params.pairs ?? []);
+   298→      return `${RECIPE_HEADER}
+   299→pairs = json.loads('''${pairs}''')
+   300→struct = load_structure("${inputPath}")
+   301→def find_atom(struct, chain, resno, atom=None):
+   302→    for model in struct:
+   303→        if chain not in model:
+   304→            continue
+   305→        for res in model[chain]:
+   306→            if res.id[1] == resno:
+   307→                if atom:
+   308→                    if atom in res:
+   309→                        return res[atom]
+   310→                else:
+   311→                    if "CA" in res:
+   312→                        return res["CA"]
+   313→                    for a in res:
+   314→                        return a
+   315→    return None
+   316→results = []
+   317→for p in pairs:
+   318→    parts = p.split()
+   319→    if len(parts) < 2:
+   320→        results.append({"query": p, "error": "format: chain resno [atom]"})
+   321→        continue
+   322→    chain = parts[0]
+   323→    try:
+   324→        resno = int(parts[1])
+   325→    except ValueError:
+   326→        results.append({"query": p, "error": "resno must be int"})
+   327→        continue
+   328→    atom = parts[2] if len(parts) > 2 else None
+   329→    a = find_atom(struct, chain, resno, atom)
+   330→    if a:
+   331→        results.append({
+   332→            "query": p,
+   333→            "chain": chain, "resno": resno, "atom": atom or a.get_name(),
+   334→            "coord": [round(float(a.coord[0]),3), round(float(a.coord[1]),3), round(float(a.coord[2]),3)],
+   335→        })
+   336→    else:
+   337→        results.append({"query": p, "error": "atom not found"})
+   338→# Compute pairwise distances for all found atoms
+   339→found = [r for r in results if "coord" in r]
+   340→dists = []
+   341→for i in range(len(found)):
+   342→    for j in range(i+1, len(found)):
+   343→        ci = found[i]["coord"]; cj = found[j]["coord"]
+   344→        d = round(float(((ci[0]-cj[0])**2 + (ci[1]-cj[1])**2 + (ci[2]-cj[2])**2)**0.5), 3)
+   345→        dists.append({"a": found[i]["query"], "b": found[j]["query"], "distance_A": d})
+   346→print(json.dumps({"atoms": found, "distances": dists}, ensure_ascii=False, indent=2))
+   347→`;
+   348→    },
+   349→  },
+   350→  {
+   351→    id: "interface_residues",
+   352→    label: "界面残基 (距离截断)",
+   353→    description: "通过距离截断检测两条链之间的界面残基和接触原子",
+   354→    requires: ["biopython"],
+   355→    params: [
+   356→      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+   357→      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+   358→      { name: "cutoff", type: "number", required: false, description: "距离截断 (Å)，默认 5.0" },
+   359→    ],
+   360→    buildScript: (inputPath, params) => {
+   361→      const chain1 = String(params.chain1 ?? "A");
+   362→      const chain2 = String(params.chain2 ?? "B");
+   363→      const cutoff = Number(params.cutoff ?? 5.0);
+   364→      return `${RECIPE_HEADER}
+   365→from Bio.PDB import NeighborSearch
+   366→struct = load_structure("${inputPath}")
+   367→chain1 = "${chain1}"
+   368→chain2 = "${chain2}"
+   369→cutoff = ${cutoff}
+   370→model = next(iter(struct))
+   371→if chain1 not in model or chain2 not in model:
+   372→    print(json.dumps({"error": f"chain {chain1} or {chain2} not found", "available_chains": [c.id for c in model]}))
+   373→    raise SystemExit
+   374→atoms1 = list(model[chain1].get_atoms())
+   375→atoms2 = list(model[chain2].get_atoms())
+   376→ns = NeighborSearch(atoms1 + atoms2)
+   377→pairs = ns.search_all(cutoff, level="A")
+   378→cross = [(a, b) for (a, b) in pairs if a.get_parent().get_parent().id != b.get_parent().get_parent().id]
+   379→res1 = {}; res2 = {}
+   380→for a, b in cross:
+   381→    ra = a.get_parent(); rb = b.get_parent()
+   382→    ca = a.get_parent().get_parent().id; cb = b.get_parent().get_parent().id
+   383→    d = round(float(a - b), 2)
+   384→    if ca == chain1:
+   385→        res1.setdefault((ra.id[1], ra.resname), []).append({"atom": a.get_name(), "to_chain": cb, "to_res": rb.id[1], "to_name": rb.resname, "dist": d})
+   386→        res2.setdefault((rb.id[1], rb.resname), []).append({"atom": b.get_name(), "to_chain": ca, "to_res": ra.id[1], "to_name": ra.resname, "dist": d})
+   387→    else:
+   388→        res1.setdefault((rb.id[1], rb.resname), []).append({"atom": b.get_name(), "to_chain": ca, "to_res": ra.id[1], "to_name": ra.resname, "dist": d})
+   389→        res2.setdefault((ra.id[1], ra.resname), []).append({"atom": a.get_name(), "to_chain": cb, "to_res": rb.id[1], "to_name": rb.resname, "dist": d})
+   390→def summarize(d):
+   391→    out = []
+   392→    for (resno, name), contacts in sorted(d.items()):
+   393→        contacts.sort(key=lambda x: x["dist"])
+   394→        types = set()
+   395→        for c in contacts:
+   396→            an = c["atom"]
+   397→            if an.startswith(("N", "O")) or an in ("ND1","ND2","NE1","NE2","NZ","OD1","OD2","OE1","OE2","OG","OG1","OH","NH1","NH2"):
+   398→                types.add("polar/H-bond")
+   399→            elif an.startswith(("C", "S")) or an in ("SD","SG"):
+   400→                types.add("hydrophobic")
+   401→            else:
+   402→                types.add("other")
+   403→        out.append({
+   404→            "resno": int(resno), "name": name, "n_contacts": len(contacts),
+   405→            "min_dist": float(contacts[0]["dist"]), "contacts": contacts[:5],
+   406→            "contact_types": sorted(types),
+   407→        })
+   408→    return out
+   409→hbonds = 0
+   410→for (a, b) in cross:
+   411→    d = float(a - b)
+   412→    if d < 3.5:
+   413→        an = a.get_name(); bn = b.get_name()
+   414→        if (an.startswith(("N", "O")) and bn.startswith(("N", "O"))) or \\
+   415→           (an in ("ND1","ND2","NE1","NE2","NZ","OD1","OD2","OE1","OE2","OG","OG1","OH","NH1","NH2") and
+   416→            bn in ("ND1","ND2","NE1","NE2","NZ","OD1","OD2","OE1","OE2","OG","OG1","OH","NH1","NH2")):
+   417→            hbonds += 1
+   418→print(json.dumps({
+   419→    "chain1": chain1, "chain2": chain2, "cutoff": cutoff,
+   420→    "total_atom_pairs": len(cross),
+   421→    "potential_hbonds_lt_3_5A": hbonds,
+   422→    "chain1_interface_residues": summarize(res1),
+   423→    "chain2_interface_residues": summarize(res2),
+   424→}, ensure_ascii=False, indent=2))
+   425→`;
+   426→    },
+   427→  },
+   428→  {
+   429→    id: "sasa",
+   430→    label: "溶剂可及表面积 (SASA)",
+   431→    description: "计算每条链的 SASA 和总 SASA",
+   432→    requires: ["freesasa"],
+   433→    params: [],
+   434→    buildScript: (inputPath) => `
+   435→import json
+   436→import freesasa
+   437→freesasa.setVerbosity(freesasa.silent)
+   438→struct = freesasa.Structure("${inputPath}")
+   439→result = freesasa.calc(struct)
+   440→total = result.totalArea()
+   441→chain_areas = {}
+   442→residue_areas = result.residueAreas()
+   443→for cid in residue_areas:
+   444→    area = sum(r.total for r in residue_areas[cid].values())
+   445→    chain_areas[cid] = round(float(area), 2)
+   446→print(json.dumps({
+   447→    "total_sasa_A2": round(float(total), 2),
+   448→    "chain_sasa_A2": chain_areas,
+   449→    "n_chains": len(chain_areas),
+   450→}, ensure_ascii=False, indent=2))
+   451→`,
+   452→  },
+   453→  {
+   454→    id: "disulfide_bonds",
+   455→    label: "二硫键",
+   456→    description: "检测所有 CYS-CYS SG-SG 距离 < 2.5Å 的二硫键",
+   457→    requires: ["biopython"],
+   458→    params: [
+   459→      { name: "cutoff", type: "number", required: false, description: "距离截断 (Å)，默认 2.5" },
+   460→    ],
+   461→    buildScript: (inputPath, params) => {
+   462→      const cutoff = Number(params.cutoff ?? 2.5);
+   463→      return `${RECIPE_HEADER}
+   464→from Bio.PDB import NeighborSearch
+   465→struct = load_structure("${inputPath}")
+   466→cutoff = ${cutoff}
+   467→model = next(iter(struct))
+   468→sg_atoms = []
+   469→for res in model.get_residues():
+   470→    if res.resname == "CYS" and "SG" in res:
+   471→        sg_atoms.append(res["SG"])
+   472→ns = NeighborSearch(sg_atoms)
+   473→pairs = ns.search_all(cutoff, level="A")
+   474→bonds = []
+   475→for a, b in pairs:
+   476→    ra = a.get_parent(); rb = b.get_parent()
+   477→    ca = ra.get_parent().id; cb = rb.get_parent().id
+   478→    bonds.append({
+   479→        "chain1": ca, "resno1": int(ra.id[1]),
+   480→        "chain2": cb, "resno2": int(rb.id[1]),
+   481→        "distance_A": round(float(a - b), 3),
+   482→    })
+   483→print(json.dumps({"count": len(bonds), "bonds": bonds, "cutoff": cutoff}, ensure_ascii=False, indent=2))
+   484→`;
+   485→    },
+   486→  },
+   487→  {
+   488→    id: "contact_map",
+   489→    label: "接触图 (链间)",
+   490→    description: "生成两条链之间所有残基-残基接触的简表 (距离 < cutoff)",
+   491→    requires: ["biopython"],
+   492→    params: [
+   493→      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+   494→      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+   495→      { name: "cutoff", type: "number", required: false, description: "距离截断 (Å)，默认 8.0" },
+   496→    ],
+   497→    buildScript: (inputPath, params) => {
+   498→      const chain1 = String(params.chain1 ?? "A");
+   499→      const chain2 = String(params.chain2 ?? "B");
+   500→      const cutoff = Number(params.cutoff ?? 8.0);
+   501→      return `${RECIPE_HEADER}
+   502→from Bio.PDB import NeighborSearch
+   503→struct = load_structure("${inputPath}")
+   504→chain1 = "${chain1}"; chain2 = "${chain2}"; cutoff = ${cutoff}
+   505→model = next(iter(struct))
+   506→if chain1 not in model or chain2 not in model:
+   507→    print(json.dumps({"error": f"chain {chain1} or {chain2} not found", "available_chains": [c.id for c in model]}))
+   508→    raise SystemExit
+   509→# Use CA atoms only for a residue-level contact map
+   510→ca1 = [r["CA"] for r in model[chain1] if "CA" in r and r.id[0].strip() == ""]
+   511→ca2 = [r["CA"] for r in model[chain2] if "CA" in r and r.id[0].strip() == ""]
+   512→ns = NeighborSearch(ca1 + ca2)
+   513→pairs = ns.search_all(cutoff, level="A")
+   514→cross = [(a, b) for (a, b) in pairs if a.get_parent().get_parent().id != b.get_parent().get_parent().id]
+   515→contacts = []
+   516→for a, b in cross:
+   517→    ra = a.get_parent(); rb = b.get_parent()
+   518→    contacts.append({
+   519→        "res1": f"{ra.resname}{ra.id[1]}({a.get_parent().get_parent().id})",
+   520→        "res2": f"{rb.resname}{rb.id[1]}({b.get_parent().get_parent().id})",
+   521→        "ca_distance_A": round(float(a - b), 2),
+   522→    })
+   523→contacts.sort(key=lambda x: x["ca_distance_A"])
+   524→print(json.dumps({
+   525→    "chain1": chain1, "chain2": chain2, "cutoff": cutoff,
+   526→    "total_ca_contacts": len(contacts),
+   527→    "contacts": contacts[:50],  # top 50 closest
+   528→}, ensure_ascii=False, indent=2))
+   529→`;
+   530→    },
+   531→  },
+   532→  {
+   533→    id: "hbonds",
+   534→    label: "氢键检测 (H-bonds, Mills-Dean 几何标准)",
+   535→    description:
+   536→      "基于 Mills & Dean (1996) 几何标准检测氢键：考虑供体/受体原子类型、距离和角度。参考 ChimeraX 的实现。",
+   537→    requires: ["biopython", "numpy"],
+   538→    params: [
+   539→      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+   540→      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+   541→      {
+   542→        name: "distanceCutoff",
+   543→        type: "number",
+   544→        required: false,
+   545→        description: "距离容差 (Å)，加到 Mills-Dean 上限上，默认 0.4",
+   546→      },
+   547→      {
+   548→        name: "angleTolerance",
+   549→        type: "number",
+   550→        required: false,
+   551→        description: "角度容差 (度)，从下限减去，默认 20.0",
+   552→      },
+   553→    ],
+   554→    buildScript: (inputPath, params) => {
+   555→      const chain1 = String(params.chain1 ?? "A");
+   556→      const chain2 = String(params.chain2 ?? "B");
+   557→      const distTol = Number(params.distanceCutoff ?? 0.4);
+   558→      const angleTol = Number(params.angleTolerance ?? 20.0);
+   559→      return `${RECIPE_HEADER}
+   560→from Bio.PDB import NeighborSearch
+   561→import numpy as np
+   562→import math
+   563→
+   564→struct = load_structure("${inputPath}")
+   565→chain1_id = "${chain1}"; chain2_id = "${chain2}"
+   566→dist_tolerance = ${distTol}  # added to distance upper bounds
+   567→angle_tolerance = ${angleTol}  # subtracted from angle lower bounds
+   568→model = next(iter(struct))
+   569→if chain1_id not in model or chain2_id not in model:
+   570→    print(json.dumps({"error": f"chain not found", "available": [c.id for c in model]}))
+   571→    raise SystemExit
+   572→
+   573→# ============================================================
+   574→# Donor/Acceptor atom classification (ChimeraX-style)
+   575→# ============================================================
+   576→
+   577→# Standard donor atoms (hydrogen-bearing N, O, S)
+   578→DONOR_ATOMS = {
+   579→    # Backbone
+   580→    'N': 'amide',       # backbone amide N (donor)
+   581→    'O': 'hydroxyl',    # could be carbonyl (acceptor) or hydroxyl (both)
+   582→    'OXT': 'carboxyl',  # terminal carboxyl
+   583→    # Sidechain donors
+   584→    'NZ': 'amine',      # LYS
+   585→    'NH1': 'guanidinium', 'NH2': 'guanidinium', 'NE': 'guanidinium',  # ARG
+   586→    'ND1': 'imidazole', 'NE2': 'imidazole',  # HIS
+   587→    'OG': 'hydroxyl', 'OG1': 'hydroxyl',     # SER, THR
+   588→    'OH': 'hydroxyl',                         # TYR
+   589→    'SG': 'thiol',                            # CYS
+   590→    'NE1': 'indole',                          # TRP
+   591→    # Nucleic acid
+   592→    'N6': 'amine', 'N4': 'amine', 'N2': 'amine',
+   593→    'O2': 'carbonyl', 'O4': 'hydroxyl', 'O6': 'carbonyl',
+   594→}
+   595→
+   596→# Standard acceptor atoms (lone-pair bearing N, O, S)
+   597→ACCEPTOR_ATOMS = {
+   598→    'O': 'carbonyl',     # backbone carbonyl O (acceptor)
+   599→    'OXT': 'carboxyl',   # terminal carboxyl
+   600→    'OD1': 'carboxyl', 'OD2': 'carboxyl',  # ASP
+   601→    'OE1': 'carboxyl', 'OE2': 'carboxyl',  # GLU
+   602→    'OG': 'hydroxyl', 'OG1': 'hydroxyl',   # SER, THR (both donor & acceptor)
+   603→    'OH': 'hydroxyl',                       # TYR
+   604→    'ND1': 'imidazole', 'NE2': 'imidazole', # HIS (both)
+   605→    'N': 'amide',                           # backbone N can accept in some contexts
+   606→    'SG': 'thiol',                          # CYS (weak acceptor)
+   607→    # Nucleic acid
+   608→    'N7': 'ring', 'N3': 'ring',
+   609→    'O2': 'carbonyl', 'O4': 'hydroxyl', 'O6': 'carbonyl',
+   610→    'OP1': 'phosphate', 'OP2': 'phosphate', 'OP3': 'phosphate',
+   611→}
+   612→
+   613→# Mills-Dean distance upper bounds (Å) by donor-acceptor type pair
+   614→# Simplified from Tables 5-8 in Mills & Dean (1996)
+   615→# Key: (donor_type, acceptor_type) → max distance
+   616→MD_DIST = {
+   617→    ('amide', 'carbonyl'): 3.5,    # N-H...O=C
+   618→    ('amide', 'carboxyl'): 3.5,
+   619→    ('amide', 'hydroxyl'): 3.5,
+   620→    ('amine', 'carbonyl'): 3.4,    # NZ-H...O
+   621→    ('amine', 'carboxyl'): 3.4,
+   622→    ('amine', 'hydroxyl'): 3.4,
+   623→    ('guanidinium', 'carboxyl'): 3.4,  # ARG...ASP/GLU
+   624→    ('guanidinium', 'carbonyl'): 3.4,
+   625→    ('imidazole', 'carbonyl'): 3.4,
+   626→    ('imidazole', 'carboxyl'): 3.4,
+   627→    ('hydroxyl', 'carbonyl'): 3.2,  # SER/THR/TYR...O
+   628→    ('hydroxyl', 'carboxyl'): 3.2,
+   629→    ('hydroxyl', 'hydroxyl'): 3.2,
+   630→    ('indole', 'carbonyl'): 3.4,
+   631→    ('thiol', 'carbonyl'): 3.5,
+   632→    ('thiol', 'carboxyl'): 3.5,
+   633→    ('carboxyl', 'carbonyl'): 3.3,
+   634→    ('carboxyl', 'hydroxyl'): 3.3,
+   635→    ('carboxyl', 'carboxyl'): 3.3,
+   636→    # Default fallback
+   637→    ('default', 'default'): 3.5,
+   638→}
+   639→
+   640→# Angle criteria: minimum D-H...A angle (degrees)
+   641→# In absence of explicit H, we use the X-D...A angle where X is the
+   642→# atom bonded to the donor (e.g., C-N...O for backbone)
+   643→MD_ANGLE_MIN = {
+   644→    'amide': 120.0,       # backbone N
+   645→    'amine': 110.0,       # LYS NZ
+   646→    'guanidinium': 110.0, # ARG
+   647→    'imidazole': 110.0,   # HIS
+   648→    'hydroxyl': 90.0,     # SER/THR/TYR (relaxed due to rotatable H)
+   649→    'thiol': 90.0,        # CYS
+   650→    'indole': 110.0,      # TRP
+   651→    'carboxyl': 110.0,
+   652→    'default': 90.0,
+   653→}
+   654→
+   655→def get_donor_type(atom_name, resname):
+   656→    if atom_name in DONOR_ATOMS:
+   657→        return DONOR_ATOMS[atom_name]
+   658→    if atom_name == 'N': return 'amide'
+   659→    if atom_name.startswith('O') and atom_name not in ('OD1','OD2','OE1','OE2','OXT'):
+   660→        return 'hydroxyl'
+   661→    return None
+   662→
+   663→def get_acceptor_type(atom_name, resname):
+   664→    if atom_name in ACCEPTOR_ATOMS:
+   665→        return ACCEPTOR_ATOMS[atom_name]
+   666→    return None
+   667→
+   668→def get_max_dist(donor_type, acceptor_type):
+   669→    return MD_DIST.get((donor_type, acceptor_type),
+   670→           MD_DIST.get((donor_type, 'default'),
+   671→           MD_DIST.get(('default', acceptor_type),
+   672→           MD_DIST[('default', 'default')])))
+   673→
+   674→def get_min_angle(donor_type):
+   675→    return MD_ANGLE_MIN.get(donor_type, MD_ANGLE_MIN['default'])
+   676→
+   677→def vec_sub(a, b):
+   678→    return np.array(a) - np.array(b)
+   679→
+   680→def calc_angle(p1, p2, p3):
+   681→    """Angle at p2 formed by p1-p2-p3 (degrees)"""
+   682→    v1 = vec_sub(p1, p2)
+   683→    v2 = vec_sub(p3, p2)
+   684→    cos_a = np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2) + 1e-10)
+   685→    cos_a = max(-1, min(1, cos_a))
+   686→    return math.degrees(math.acos(cos_a))
+   687→
+   688→# ============================================================
+   689→# Collect potential donor and acceptor atoms from both chains
+   690→# ============================================================
+   691→chain1_atoms = list(model[chain1_id].get_atoms())
+   692→chain2_atoms = list(model[chain2_id].get_atoms())
+   693→
+   694→# Build atom info: (atom, res, chain, is_donor, is_acceptor, donor_type, acceptor_type, bonded_atom)
+   695→def classify_atoms(atoms, chain_id):
+   696→    result = []
+   697→    for atom in atoms:
+   698→        name = atom.get_name()
+   699→        res = atom.get_parent()
+   700→        if res.id[0].strip() != "": continue  # skip HETATM
+   701→        # Skip hydrogens
+   702→        if name.startswith('H'): continue
+   703→        elem = atom.element or ''
+   704→        dt = get_donor_type(name, res.resname)
+   705→        at = get_acceptor_type(name, res.resname)
+   706→        is_donor = dt is not None and elem in ('N', 'O', 'S')
+   707→        is_acceptor = at is not None and elem in ('N', 'O', 'S')
+   708→        # Find bonded heavy atom (for angle calc when no explicit H)
+   709→        bonded = None
+   710→        if is_donor:
+   711→            # For backbone N: bonded to CA and C(prev)
+   712→            # For sidechain: find C or other heavy atom bonded to this atom
+   713→            bonded = None
+   714→            for other in res:
+   715→                if other is atom: continue
+   716→                if other.element in ('C', 'S') and other.get_name() != 'H':
+   717→                    # Simple distance-based bond check
+   718→                    d = float(atom - other)
+   719→                    if d < 2.0:
+   720→                        bonded = other
+   721→                        break
+   722→        result.append({
+   723→            'atom': atom, 'res': res, 'chain': chain_id,
+   724→            'name': name, 'element': elem,
+   725→            'is_donor': is_donor, 'is_acceptor': is_acceptor,
+   726→            'donor_type': dt, 'acceptor_type': at,
+   727→            'bonded_atom': bonded,
+   728→        })
+   729→    return result
+   730→
+   731→info1 = classify_atoms(chain1_atoms, chain1_id)
+   732→info2 = classify_atoms(chain2_atoms, chain2_id)
+   733→
+   734→# Use NeighborSearch for initial distance screening (generous cutoff)
+   735→all_atoms = [x['atom'] for x in info1 + info2]
+   736→ns = NeighborSearch(all_atoms)
+   737→search_cutoff = 4.0  # generous, will filter with precise criteria
+   738→pairs = ns.search_all(search_cutoff, level="A")
+   739→
+   740→hbonds = []
+   741→for a, b in pairs:
+   742→    # Must be cross-chain
+   743→    if a.get_parent().get_parent().id == b.get_parent().get_parent().id:
+   744→        continue
+   745→    # Find info records
+   746→    info_a = None; info_b = None
+   747→    for x in info1 + info2:
+   748→        if x['atom'] is a: info_a = x
+   749→        if x['atom'] is b: info_b = x
+   750→    if not info_a or not info_b: continue
+   751→    # Try both directions: a=donor, b=acceptor AND b=donor, a=acceptor
+   752→    for donor_info, acceptor_info in [(info_a, info_b), (info_b, info_a)]:
+   753→        if not donor_info['is_donor'] or not acceptor_info['is_acceptor']:
+   754→            continue
+   755→        dt = donor_info['donor_type']
+   756→        at = acceptor_info['acceptor_type']
+   757→        if not dt or not at: continue
+   758→        max_dist = get_max_dist(dt, at) + dist_tolerance
+   759→        dist = float(donor_info['atom'] - acceptor_info['atom'])
+   760→        if dist > max_dist: continue
+   761→        # Angle check (if we have a bonded atom for angle calculation)
+   762→        angle = None
+   763→        if donor_info['bonded_atom'] is not None:
+   764→            min_angle = get_min_angle(dt) - angle_tolerance
+   765→            # Angle: bonded_atom - donor - acceptor
+   766→            angle = calc_angle(
+   767→                donor_info['bonded_atom'].coord,
+   768→                donor_info['atom'].coord,
+   769→                acceptor_info['atom'].coord
+   770→            )
+   771→            if angle < min_angle: continue
+   772→        # This is a valid H-bond
+   773→        d_res = donor_info['res']
+   774→        a_res = acceptor_info['res']
+   775→        hbonds.append({
+   776→            'donor_chain': donor_info['chain'],
+   777→            'donor_resno': int(d_res.id[1]),
+   778→            'donor_resname': d_res.resname,
+   779→            'donor_atom': donor_info['name'],
+   780→            'donor_type': dt,
+   781→            'acceptor_chain': acceptor_info['chain'],
+   782→            'acceptor_resno': int(a_res.id[1]),
+   783→            'acceptor_resname': a_res.resname,
+   784→            'acceptor_atom': acceptor_info['name'],
+   785→            'acceptor_type': at,
+   786→            'distance_A': round(dist, 2),
+   787→            'angle_deg': round(angle, 1) if angle is not None else None,
+   788→            'criteria': f'{dt}→{at} (max {max_dist:.1f}Å)',
+   789→        })
+   790→
+   791→# Dedupe
+   792→seen = set()
+   793→unique_hbonds = []
+   794→for h in sorted(hbonds, key=lambda x: x['distance_A']):
+   795→    key = (h['donor_chain'], h['donor_resno'], h['donor_atom'],
+   796→           h['acceptor_chain'], h['acceptor_resno'], h['acceptor_atom'])
+   797→    if key not in seen:
+   798→        seen.add(key)
+   799→        unique_hbonds.append(h)
+   800→
+   801→# Summary by residue pair
+   802→residue_pairs = {}
+   803→for h in unique_hbonds:
+   804→    pk = f"{h['donor_resname']}{h['donor_resno']}({h['donor_chain']}) - {h['acceptor_resname']}{h['acceptor_resno']}({h['acceptor_chain']})"
+   805→    residue_pairs[pk] = residue_pairs.get(pk, 0) + 1
+   806→top_pairs = sorted(residue_pairs.items(), key=lambda x: -x[1])[:10]
+   807→
+   808→print(json.dumps({
+   809→    "chain1": chain1_id, "chain2": chain2_id,
+   810→    "method": "Mills-Dean geometric criteria (ChimeraX-style)",
+   811→    "dist_tolerance": dist_tolerance,
+   812→    "angle_tolerance": angle_tolerance,
+   813→    "total_hbonds": len(unique_hbonds),
+   814→    "hbonds": unique_hbonds[:40],
+   815→    "top_residue_pairs": [{"pair": p, "count": c} for p, c in top_pairs],
+   816→}, ensure_ascii=False, indent=2))
+   817→`;
+   818→    },
+   819→  },
+   820→  {
+   821→    id: "salt_bridges",
+   822→    label: "盐桥检测 (Salt Bridges)",
+   823→    description:
+   824→      "检测两条链之间的盐桥：正电残基 (ARG/LYS/HIS) 与负电残基 (ASP/GLU) 之间 < 4.0Å",
+   825→    requires: ["biopython"],
+   826→    params: [
+   827→      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+   828→      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+   829→      {
+   830→        name: "cutoff",
+   831→        type: "number",
+   832→        required: false,
+   833→        description: "距离截断 (Å)，默认 4.0",
+   834→      },
+   835→    ],
+   836→    buildScript: (inputPath, params) => {
+   837→      const chain1 = String(params.chain1 ?? "A");
+   838→      const chain2 = String(params.chain2 ?? "B");
+   839→      const cutoff = Number(params.cutoff ?? 4.0);
+   840→      return `${RECIPE_HEADER}
+   841→from Bio.PDB import NeighborSearch
+   842→struct = load_structure("${inputPath}")
+   843→chain1 = "${chain1}"; chain2 = "${chain2}"; cutoff = ${cutoff}
+   844→model = next(iter(struct))
+   845→if chain1 not in model or chain2 not in model:
+   846→    print(json.dumps({"error": f"chain {chain1} or {chain2} not found", "available_chains": [c.id for c in model]}))
+   847→    raise SystemExit
+   848→POS = {'ARG': ['NH1', 'NH2', 'NE'], 'LYS': ['NZ'], 'HIS': ['ND1', 'NE2']}
+   849→NEG = {'ASP': ['OD1', 'OD2'], 'GLU': ['OE1', 'OE2']}
+   850→pos_atoms1 = [a for r in model[chain1] if r.resname in POS for a in r if a.get_name() in POS[r.resname]]
+   851→neg_atoms1 = [a for r in model[chain1] if r.resname in NEG for a in r if a.get_name() in NEG[r.resname]]
+   852→pos_atoms2 = [a for r in model[chain2] if r.resname in POS for a in r if a.get_name() in POS[r.resname]]
+   853→neg_atoms2 = [a for r in model[chain2] if r.resname in NEG for a in r if a.get_name() in NEG[r.resname]]
+   854→all_atoms = pos_atoms1 + neg_atoms1 + pos_atoms2 + neg_atoms2
+   855→ns = NeighborSearch(all_atoms)
+   856→pairs = ns.search_all(cutoff, level="A")
+   857→bridges = []
+   858→for a, b in pairs:
+   859→    ca = a.get_parent().get_parent().id; cb = b.get_parent().get_parent().id
+   860→    if ca == cb:
+   861→        continue
+   862→    ra = a.get_parent(); rb = b.get_parent()
+   863→    a_pos = ra.resname in POS and a.get_name() in POS[ra.resname]
+   864→    b_pos = rb.resname in POS and b.get_name() in POS[rb.resname]
+   865→    a_neg = ra.resname in NEG and a.get_name() in NEG[ra.resname]
+   866→    b_neg = rb.resname in NEG and b.get_name() in NEG[rb.resname]
+   867→    if not ((a_pos and b_neg) or (a_neg and b_pos)):
+   868→        continue
+   869→    bridges.append({
+   870→        "pos_chain": ca if a_pos else cb,
+   871→        "pos_resno": int(ra.id[1]) if a_pos else int(rb.id[1]),
+   872→        "pos_resname": ra.resname if a_pos else rb.resname,
+   873→        "pos_atom": a.get_name() if a_pos else b.get_name(),
+   874→        "neg_chain": cb if a_pos else ca,
+   875→        "neg_resno": int(rb.id[1]) if a_pos else int(ra.id[1]),
+   876→        "neg_resname": rb.resname if a_pos else ra.resname,
+   877→        "neg_atom": b.get_name() if a_pos else a.get_name(),
+   878→        "distance_A": round(float(a - b), 2),
+   879→    })
+   880→bridges.sort(key=lambda x: x["distance_A"])
+   881→print(json.dumps({
+   882→    "chain1": chain1, "chain2": chain2, "cutoff": cutoff,
+   883→    "total_salt_bridges": len(bridges),
+   884→    "salt_bridges": bridges,
+   885→}, ensure_ascii=False, indent=2))
+   886→`;
+   887→    },
+   888→  },
+   889→  {
+   890→    id: "hydrophobic_contacts",
+   891→    label: "疏水接触 (Hydrophobic)",
+   892→    description:
+   893→      "检测两条链之间的疏水接触：疏水残基 (ALA/VAL/LEU/ILE/MET/PHE/TRP/PRO) 之间 < 4.5Å",
+   894→    requires: ["biopython"],
+   895→    params: [
+   896→      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+   897→      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+   898→      {
+   899→        name: "cutoff",
+   900→        type: "number",
+   901→        required: false,
+   902→        description: "距离截断 (Å)，默认 4.5",
+   903→      },
+   904→    ],
+   905→    buildScript: (inputPath, params) => {
+   906→      const chain1 = String(params.chain1 ?? "A");
+   907→      const chain2 = String(params.chain2 ?? "B");
+   908→      const cutoff = Number(params.cutoff ?? 4.5);
+   909→      return `${RECIPE_HEADER}
+   910→from Bio.PDB import NeighborSearch
+   911→struct = load_structure("${inputPath}")
+   912→chain1 = "${chain1}"; chain2 = "${chain2}"; cutoff = ${cutoff}
+   913→model = next(iter(struct))
+   914→if chain1 not in model or chain2 not in model:
+   915→    print(json.dumps({"error": f"chain {chain1} or {chain2} not found", "available_chains": [c.id for c in model]}))
+   916→    raise SystemExit
+   917→HYDROPHOBIC = {'ALA', 'VAL', 'LEU', 'ILE', 'MET', 'PHE', 'TRP', 'PRO'}
+   918→h1 = [a for r in model[chain1] if r.resname in HYDROPHOBIC for a in r if a.element == 'C']
+   919→h2 = [a for r in model[chain2] if r.resname in HYDROPHOBIC for a in r if a.element == 'C']
+   920→ns = NeighborSearch(h1 + h2)
+   921→pairs = ns.search_all(cutoff, level="A")
+   922→contacts = []
+   923→for a, b in pairs:
+   924→    if a.get_parent().get_parent().id == b.get_parent().get_parent().id:
+   925→        continue
+   926→    ra = a.get_parent(); rb = b.get_parent()
+   927→    contacts.append({
+   928→        "chain1": a.get_parent().get_parent().id,
+   929→        "resno1": int(ra.id[1]), "resname1": ra.resname,
+   930→        "atom1": a.get_name(),
+   931→        "chain2": b.get_parent().get_parent().id,
+   932→        "resno2": int(rb.id[1]), "resname2": rb.resname,
+   933→        "atom2": b.get_name(),
+   934→        "distance_A": round(float(a - b), 2),
+   935→    })
+   936→# Aggregate by residue pair
+   937→res_pairs = {}
+   938→for c in contacts:
+   939→    key = tuple(sorted([(c["resname1"] + str(c["resno1"]) + "(" + c["chain1"] + ")"),
+   940→                         (c["resname2"] + str(c["resno2"]) + "(" + c["chain2"] + ")")]))
+   941→    res_pairs[key] = res_pairs.get(key, 0) + 1
+   942→top = sorted(res_pairs.items(), key=lambda x: -x[1])[:20]
+   943→print(json.dumps({
+   944→    "chain1": chain1, "chain2": chain2, "cutoff": cutoff,
+   945→    "total_atom_contacts": len(contacts),
+   946→    "total_residue_pairs": len(res_pairs),
+   947→    "top_residue_pairs": [{"pair": " <-> ".join(k), "contacts": v} for k, v in top],
+   948→}, ensure_ascii=False, indent=2))
+   949→`;
+   950→    },
+   951→  },
+   952→  {
+   953→    id: "ramachandran",
+   954→    label: "Ramachandran 图 (φ/ψ 角)",
+   955→    description:
+   956→      "计算所有残基的 φ/ψ 二面角，返回分布数据 + 落在允许/不允许区域的比例",
+   957→    requires: ["biopython"],
+   958→    params: [
+   959→      {
+   960→        name: "chain",
+   961→        type: "string",
+   962→        required: false,
+   963→        description: "链 ID（可选，默认全部链）",
+   964→      },
+   965→    ],
+   966→    buildScript: (inputPath, params) => {
+   967→      const chain = String(params.chain ?? "");
+   968→      return `${RECIPE_HEADER}
+   969→from Bio.PDB import PPBuilder
+   970→import math
+   971→struct = load_structure("${inputPath}")
+   972→chain_filter = "${chain}"
+   973→model = next(iter(struct))
+   974→ppb = PPBuilder()
+   975→polypeptides = []
+   976→for pp in ppb.build_peptides(model):
+   977→    if chain_filter and pp[0].get_parent().id != chain_filter:
+   978→        continue
+   979→    polypeptides.append(pp)
+   980→data = []
+   981→regions = {"favoured": 0, "allowed": 0, "outlier": 0, "gly": 0, "pro": 0, "pre_pro": 0}
+   982→for pp in polypeptides:
+   983→    try:
+   984→        phipsi = list(pp.get_phi_psi_list())
+   985→    except Exception:
+   986→        continue
+   987→    for i, (phi, psi) in enumerate(phipsi):
+   988→        if phi is None or psi is None:
+   989→            continue
+   990→        # phi = C(i-1)-N(i)-CA(i)-C(i); psi = N(i)-CA(i)-C(i)-N(i+1)
+   991→        # The residue with phi/psi is the i-th residue in the peptide (0-indexed)
+   992→        # because get_phi_psi_list returns phi/psi for each residue starting from
+   993→        # the first (which has no phi if N-terminus, but biopython handles that).
+   994→        try:
+   995→            res_obj = pp[i] if i < len(pp) else None
+   996→            resno = res_obj.id[1] if res_obj else i + 1
+   997→            resname = res_obj.resname if res_obj else "X"
+   998→        except Exception:
+   999→            resno = i + 1
+  1000→            resname = "X"
+  1001→        # Classify region (approximate Ramachandran boundaries)
+  1002→        phi_d = math.degrees(phi)
+  1003→        psi_d = math.degrees(psi)
+  1004→        region = "outlier"
+  1005→        # Favoured: alpha-helix (-150<=phi<=-30, -90<=psi<=45) OR beta-sheet (-180<=phi<=-30, 90<=psi<=180)
+  1006→        if (-150 <= phi_d <= -30 and -90 <= psi_d <= 45) or (-180 <= phi_d <= -30 and 90 <= psi_d <= 180):
+  1007→            region = "favoured"
+  1008→        elif -180 <= phi_d <= 180 and -180 <= psi_d <= 180:
+  1009→            region = "allowed"
+  1010→        if resname == "GLY":
+  1011→            region = "gly"
+  1012→        elif resname == "PRO":
+  1013→            region = "pro"
+  1014→        elif i > 0 and pp[i - 1].resname == "PRO":
+  1015→            region = "pre_pro"
+  1016→        regions[region if region in regions else "outlier"] += 1
+  1017→        data.append({
+  1018→            "chain": pp[0].get_parent().id,
+  1019→            "resno": int(resno),
+  1020→            "resname": resname,
+  1021→            "phi": round(phi_d, 1),
+  1022→            "psi": round(psi_d, 1),
+  1023→            "region": region,
+  1024→        })
+  1025→total = len(data)
+  1026→print(json.dumps({
+  1027→    "total_residues": total,
+  1028→    "regions": regions,
+  1029→    "favoured_pct": round(100 * regions["favoured"] / max(1, total), 1),
+  1030→    "outlier_pct": round(100 * regions["outlier"] / max(1, total), 1),
+  1031→    "data": data,
+  1032→}, ensure_ascii=False, indent=2))
+  1033→`;
+  1034→    },
+  1035→  },
+  1036→  {
+  1037→    id: "ligand_interactions",
+  1038→    label: "配体互作指纹 (Ligand Fingerprint)",
+  1039→    description:
+  1040→      "检测指定配体周围 cutoff Å 内所有残基，分类接触类型（H-bond / 疏水 / 芳香 / 离子），生成互作指纹",
+  1041→    requires: ["biopython"],
+  1042→    params: [
+  1043→      {
+  1044→        name: "ligandCompId",
+  1045→        type: "string",
+  1046→        required: true,
+  1047→        description: "配体 3-letter code，如 'N3', 'REA', 'A1BII'",
+  1048→      },
+  1049→      {
+  1050→        name: "cutoff",
+  1051→        type: "number",
+  1052→        required: false,
+  1053→        description: "距离截断 (Å)，默认 5.0",
+  1054→      },
+  1055→    ],
+  1056→    buildScript: (inputPath, params) => {
+  1057→      const ligandCompId = String(params.ligandCompId ?? "");
+  1058→      const cutoff = Number(params.cutoff ?? 5.0);
+  1059→      return `${RECIPE_HEADER}
+  1060→from Bio.PDB import NeighborSearch
+  1061→from collections import defaultdict
+  1062→struct = load_structure("${inputPath}")
+  1063→ligand_id = "${ligandCompId}"
+  1064→cutoff = ${cutoff}
+  1065→model = next(iter(struct))
+  1066→# Find ligand residues
+  1067→ligand_residues = [r for r in model.get_residues() if r.resname == ligand_id]
+  1068→if not ligand_residues:
+  1069→    available_het = sorted(set(r.resname for r in model.get_residues() if r.id[0].strip() != "" and r.resname != "HOH"))
+  1070→    print(json.dumps({"error": f"ligand {ligand_id} not found", "available_ligands": available_het}))
+  1071→    raise SystemExit
+  1072→ligand_atoms = [a for r in ligand_residues for a in r]
+  1073→# Find protein/nucleic residues within cutoff
+  1074→ns = NeighborSearch(list(model.get_atoms()))
+  1075→contacts = []
+  1076→residue_contacts = defaultdict(list)
+  1077→for ligand_atom in ligand_atoms:
+  1078→    nearby = ns.search(ligand_atom.coord, cutoff, level="A")
+  1079→    for nb_atom in nearby:
+  1080→        nb_res = nb_atom.get_parent()
+  1081→        if nb_res.id[0].strip() != "" and nb_res.resname != "HOH":
+  1082→            # skip other ligand atoms of same comp
+  1083→            if nb_res.resname == ligand_id:
+  1084→                continue
+  1085→            continue
+  1086→        if nb_res.resname == "HOH":
+  1087→            continue
+  1088→        if nb_res.resname == ligand_id:
+  1089→            continue
+  1090→        # It's a protein/nucleic residue
+  1091→        d = float(ligand_atom - nb_atom)
+  1092→        # Classify
+  1093→        atom_name = nb_atom.get_name()
+  1094→        resname = nb_res.resname
+  1095→        chain = nb_res.get_parent().id
+  1096→        resno = int(nb_res.id[1])
+  1097→        contact_type = "other"
+  1098→        if atom_name.startswith(("N", "O")) or atom_name in ("ND1","ND2","NE1","NE2","NZ","OD1","OD2","OE1","OE2","OG","OG1","OH","NH1","NH2"):
+  1099→            contact_type = "H-bond"
+  1100→        elif atom_name.startswith(("C", "S")) or atom_name in ("SD", "SG"):
+  1101→            contact_type = "hydrophobic"
+  1102→        if resname in ("PHE","TYR","TRP","HIS") and atom_name in ("CG","CD1","CD2","CE1","CE2","CZ","CH2","NE1","CZ2","CZ3","CH2"):
+  1103→            contact_type = "aromatic"
+  1104→        if (resname in ("ARG","LYS","HIS") and atom_name in ("NH1","NH2","NE","NZ","ND1","NE2")) or \\
+  1105→           (resname in ("ASP","GLU") and atom_name in ("OD1","OD2","OE1","OE2")):
+  1106→            contact_type = "ionic"
+  1107→        entry = {
+  1108→            "ligand_atom": ligand_atom.get_name(),
+  1109→            "chain": chain, "resno": resno, "resname": resname,
+  1110→            "atom": atom_name, "distance_A": round(d, 2), "type": contact_type,
+  1111→        }
+  1112→        contacts.append(entry)
+  1113→        residue_contacts[(chain, resno, resname)].append((contact_type, d))
+  1114→# Aggregate per residue
+  1115→residue_summary = []
+  1116→for (chain, resno, resname), ct_list in sorted(residue_contacts.items()):
+  1117→    types = set(t for t, _ in ct_list)
+  1118→    min_d = min(d for _, d in ct_list)
+  1119→    residue_summary.append({
+  1120→        "chain": chain, "resno": resno, "resname": resname,
+  1121→        "min_distance_A": round(min_d, 2),
+  1122→        "n_contacts": len(ct_list),
+  1123→        "contact_types": sorted(types),
+  1124→    })
+  1125→residue_summary.sort(key=lambda x: x["min_distance_A"])
+  1126→# Count by type
+  1127→type_counts = defaultdict(int)
+  1128→for c in contacts:
+  1129→    type_counts[c["type"]] += 1
+  1130→print(json.dumps({
+  1131→    "ligand": ligand_id, "cutoff": cutoff,
+  1132→    "num_ligand_residues": len(ligand_residues),
+  1133→    "total_contacts": len(contacts),
+  1134→    "total_residues": len(residue_summary),
+  1135→    "type_counts": dict(type_counts),
+  1136→    "residues": residue_summary[:30],
+  1137→    "contacts": contacts[:30],
+  1138→}, ensure_ascii=False, indent=2))
+  1139→`;
+  1140→    },
+  1141→  },
+  1142→  {
+  1143→    id: "sequence_align",
+  1144→    label: "序列比对 (Pairwise)",
+  1145→    description:
+  1146→      "两条链的蛋白序列进行全局比对 (Needleman-Wunsch)，返回比对结果 + 相同度/相似度/空位率",
+  1147→    requires: ["biopython"],
+  1148→    params: [
+  1149→      {
+  1150→        name: "chain1",
+  1151→        type: "string",
+  1152→        required: true,
+  1153→        description: "链 1 ID",
+  1154→      },
+  1155→      {
+  1156→        name: "chain2",
+  1157→        type: "string",
+  1158→        required: true,
+  1159→        description: "链 2 ID",
+  1160→      },
+  1161→    ],
+  1162→    buildScript: (inputPath, params) => {
+  1163→      const chain1 = String(params.chain1 ?? "A");
+  1164→      const chain2 = String(params.chain2 ?? "B");
+  1165→      return `${RECIPE_HEADER}
+  1166→from Bio import pairwise2
+  1167→from Bio.PDB import PPBuilder
+  1168→from Bio.SeqUtils import seq1
+  1169→struct = load_structure("${inputPath}")
+  1170→chain1_id = "${chain1}"
+  1171→chain2_id = "${chain2}"
+  1172→model = next(iter(struct))
+  1173→if chain1_id not in model or chain2_id not in model:
+  1174→    print(json.dumps({"error": f"chain {chain1_id} or {chain2_id} not found", "available_chains": [c.id for c in model]}))
+  1175→    raise SystemExit
+  1176→ppb = PPBuilder()
+  1177→def get_sequence(chain_id):
+  1178→    for pp in ppb.build_peptides(model[chain_id]):
+  1179→        return "".join(seq1(r.resname) for r in pp)
+  1180→    return ""
+  1181→seq1_str = get_sequence(chain1_id)
+  1182→seq2_str = get_sequence(chain2_id)
+  1183→if not seq1_str or not seq2_str:
+  1184→    print(json.dumps({"error": "could not extract sequence"}))
+  1185→    raise SystemExit
+  1186→# Global alignment with BLOSUM62
+  1187→alignments = pairwise2.align.globalms(seq1_str, seq2_str, 2, -1, -2, -0.5, one_alignment_only=True)
+  1188→if not alignments:
+  1189→    print(json.dumps({"error": "alignment failed"}))
+  1190→    raise SystemExit
+  1191→aln = alignments[0]
+  1192→aln_seq1 = aln.seqA
+  1193→aln_seq2 = aln.seqB
+  1194→score = aln.score
+  1195→# Compute identity / similarity / gaps
+  1196→matches = 0
+  1197→similar = 0
+  1198→gaps = 0
+  1199→# Simple similarity groups
+  1200→sim_groups = [
+  1201→    set("GAVLI"), set("ST"), set("FYW"), set("KRH"), set("DE"), set("NQ"), set("CM"), set("P")
+  1202→]
+  1203→for a, b in zip(aln_seq1, aln_seq2):
+  1204→    if a == "-" or b == "-":
+  1205→        gaps += 1
+  1206→    elif a == b:
+  1207→        matches += 1
+  1208→    else:
+  1209→        for g in sim_groups:
+  1210→            if a in g and b in g:
+  1211→                similar += 1
+  1212→                break
+  1213→total = len(aln_seq1)
+  1214→identity = round(100 * matches / max(1, total), 1)
+  1215→similarity = round(100 * (matches + similar) / max(1, total), 1)
+  1216→gap_pct = round(100 * gaps / max(1, total), 1)
+  1217→# Format alignment in 60-char blocks with match line
+  1218→blocks = []
+  1219→for i in range(0, len(aln_seq1), 60):
+  1220→    s1 = aln_seq1[i:i+60]
+  1221→    s2 = aln_seq2[i:i+60]
+  1222→    ml = ""
+  1223→    for a, b in zip(s1, s2):
+  1224→        if a == b:
+  1225→            ml += "|"
+  1226→        elif a == "-" or b == "-":
+  1227→            ml += " "
+  1228→        else:
+  1229→            ml += "."
+  1230→    blocks.append({"seq1": s1, "match": ml, "seq2": s2, "start": i+1})
+  1231→print(json.dumps({
+  1232→    "chain1": chain1_id, "chain2": chain2_id,
+  1233→    "seq1_length": len(seq1_str), "seq2_length": len(seq2_str),
+  1234→    "alignment_length": total,
+  1235→    "identity_pct": identity,
+  1236→    "similarity_pct": similarity,
+  1237→    "gap_pct": gap_pct,
+  1238→    "score": round(float(score), 1),
+  1239→    "matches": matches,
+  1240→    "similar": similar,
+  1241→    "gaps": gaps,
+  1242→    "blocks": blocks,
+  1243→}, ensure_ascii=False, indent=2))
+  1244→`;
+  1245→    },
+  1246→  },
+  1247→  {
+  1248→    id: "electrostatic",
+  1249→    label: "静电势分析 (Coulombic)",
+  1250→    description:
+  1251→      "计算每个残基的净电荷 + 周围 6Å 内的库仑相互作用能（简化版，无介电衰减）",
+  1252→    requires: ["biopython"],
+  1253→    params: [
+  1254→      {
+  1255→        name: "chain",
+  1256→        type: "string",
+  1257→        required: false,
+  1258→        description: "链 ID（可选，默认全部链）",
+  1259→      },
+  1260→    ],
+  1261→    buildScript: (inputPath, params) => {
+  1262→      const chain = String(params.chain ?? "");
+  1263→      return `${RECIPE_HEADER}
+  1264→from Bio.PDB import NeighborSearch
+  1265→import math
+  1266→struct = load_structure("${inputPath}")
+  1267→chain_filter = "${chain}"
+  1268→model = next(iter(struct))
+  1269→# Residue charges (approximate, at physiological pH)
+  1270→CHARGES = {
+  1271→    'ARG': 1.0, 'LYS': 1.0, 'HIS': 0.5,  # positive (HIS partial)
+  1272→    'ASP': -1.0, 'GLU': -1.0,  # negative
+  1273→    'CYS': 0.0, 'TYR': 0.0,  # neutral (pKa ~8-10, mostly protonated)
+  1274→}
+  1275→# Atom-level charges for backbone + sidechain (very simplified)
+  1276→def atom_charge(resname, atom_name):
+  1277→    if resname in ('ARG', 'LYS', 'HIS') and atom_name in ('NZ', 'NH1', 'NH2', 'NE', 'ND1', 'NE2'):
+  1278→        return 1.0
+  1279→    if resname in ('ASP', 'GLU') and atom_name in ('OD1', 'OD2', 'OE1', 'OE2'):
+  1280→        return -1.0
+  1281→    return 0.0
+  1282→# Collect charged atoms
+  1283→charged_atoms = []
+  1284→for res in model.get_residues():
+  1285→    if res.id[0].strip() != "" and res.resname != "HOH":
+  1286→        continue
+  1287→    if chain_filter and res.get_parent().id != chain_filter:
+  1288→        continue
+  1289→    for atom in res:
+  1290→        q = atom_charge(res.resname, atom.get_name())
+  1291→        if q != 0:
+  1292→            charged_atoms.append((atom, q, res))
+  1293→# Compute per-residue net charge + Coulombic energy
+  1294→residue_data = {}
+  1295→ns = NeighborSearch([a for a, _, _ in charged_atoms])
+  1296→total_energy = 0.0
+  1297→pairs = []
+  1298→for atom, q, res in charged_atoms:
+  1299→    nearby = ns.search(atom.coord, 6.0, level="A")
+  1300→    for nb in nearby:
+  1301→        if nb is atom:
+  1302→            continue
+  1303→        nb_res = nb.get_parent()
+  1304→        if nb_res is res:
+  1305→            continue
+  1306→        # Find charge of nb
+  1307→        nb_q = 0.0
+  1308→        for a2, q2, r2 in charged_atoms:
+  1309→            if a2 is nb:
+  1310→                nb_q = q2
+  1311→                break
+  1312→        if nb_q == 0:
+  1313→            continue
+  1314→        d = float(atom - nb)
+  1315→        if d < 1.0:
+  1316→            d = 1.0
+  1317→        # Coulomb: E = k * q1 * q2 / d (k=332 for kcal/mol with Å + e)
+  1318→        e = 332.0 * q * nb_q / d
+  1319→        total_energy += e / 2.0  # divide by 2 (counted twice)
+  1320→        key = (res.get_parent().id, res.id[1], res.resname)
+  1321→        if key not in residue_data:
+  1322→            residue_data[key] = {'charge': 0.0, 'energy': 0.0, 'partners': set()}
+  1323→        residue_data[key]['energy'] += e / 2.0
+  1324→        residue_data[key]['partners'].add((nb_res.get_parent().id, nb_res.id[1], nb_res.resname))
+  1325→# Aggregate
+  1326→results = []
+  1327→for (chain_id, resno, resname), d in sorted(residue_data.items()):
+  1328→    results.append({
+  1329→        'chain': chain_id, 'resno': int(resno), 'resname': resname,
+  1330→        'charge': CHARGES.get(resname, 0.0),
+  1331→        'coulomb_energy_kcal': round(float(d['energy']), 2),
+  1332→        'n_partners': len(d['partners']),
+  1333→    })
+  1334→# Sort by absolute energy (most stabilizing/destabilizing)
+  1335→results.sort(key=lambda x: abs(x['coulomb_energy_kcal']), reverse=True)
+  1336→# Summary
+  1337→pos_count = sum(1 for r in results if r['charge'] > 0)
+  1338→neg_count = sum(1 for r in results if r['charge'] < 0)
+  1339→neutral_count = sum(1 for r in results if r['charge'] == 0)
+  1340→print(json.dumps({
+  1341→    'total_charged_residues': len(results),
+  1342→    'positive': pos_count, 'negative': neg_count, 'neutral': neutral_count,
+  1343→    'total_coulomb_energy_kcal': round(float(total_energy), 2),
+  1344→    'top_residues': results[:20],
+  1345→    'all_residues': results,
+  1346→}, ensure_ascii=False, indent=2))
+  1347→`;
+  1348→    },
+  1349→  },
+  1350→  {
+  1351→    id: "sequence_features",
+  1352→    label: "序列特征 (pI/MW/糖基化/无序)",
+  1353→    description:
+  1354→      "计算蛋白序列的等电点 pI、分子量、N-糖基化位点 (N-X-S/T) 和简化的无序倾向区域 (连续带电残基)",
+  1355→    requires: ["biopython"],
+  1356→    params: [
+  1357→      {
+  1358→        name: "chain",
+  1359→        type: "string",
+  1360→        required: false,
+  1361→        description: "链 ID（可选，默认全部链）",
+  1362→      },
+  1363→    ],
+  1364→    buildScript: (inputPath, params) => {
+  1365→      const chain = String(params.chain ?? "");
+  1366→      return `${RECIPE_HEADER}
+  1367→from Bio.SeqUtils import seq1
+  1368→from Bio.SeqUtils.IsoelectricPoint import IsoelectricPoint
+  1369→from Bio.PDB import PPBuilder
+  1370→struct = load_structure("${inputPath}")
+  1371→chain_filter = "${chain}"
+  1372→model = next(iter(struct))
+  1373→ppb = PPBuilder()
+  1374→results = []
+  1375→for c in model:
+  1376→    if chain_filter and c.id != chain_filter:
+  1377→        continue
+  1378→    # Build protein sequence
+  1379→    seq = ""
+  1380→    for pp in ppb.build_peptides(c):
+  1381→        seq = "".join(seq1(r.resname) for r in pp)
+  1382→        break
+  1383→    if not seq or len(seq) < 2:
+  1384→        results.append({
+  1385→            "chain": c.id,
+  1386→            "error": "no peptide sequence (may be DNA/RNA/ligand)",
+  1387→        })
+  1388→        continue
+  1389→    # Isoelectric point + MW
+  1390→    ip = IsoelectricPoint(seq)
+  1391→    pI = round(float(ip.pi()), 2)
+  1392→    # molecular weight (Da)
+  1393→    mw = 0.0
+  1394→    # average residue masses (Da) — including water loss for peptide bonds
+  1395→    AA_MW = {
+  1396→        'A': 71.0788, 'R': 156.1875, 'N': 114.1038, 'D': 115.0886,
+  1397→        'C': 103.1388, 'E': 129.1155, 'Q': 128.1307, 'G': 57.0519,
+  1398→        'H': 137.1411, 'I': 113.1594, 'L': 113.1594, 'K': 128.1741,
+  1399→        'M': 131.1926, 'F': 147.1766, 'P': 97.1167, 'S': 87.0782,
+  1400→        'T': 101.1051, 'W': 186.2132, 'Y': 163.1760, 'V': 99.1326,
+  1401→    }
+  1402→    for aa in seq:
+  1403→        mw += AA_MW.get(aa, 110.0)
+  1404→    mw += 18.0153  # water for N+H and C-OH termini
+  1405→    # charge at pH 7.4 (approximate)
+  1406→    charge_74 = round(float(ip.charge_at_pH(7.4)), 2)
+  1407→    # N-glycosylation motif: N-X-S/T where X != P
+  1408→    glycos_sites = []
+  1409→    for i in range(len(seq) - 2):
+  1410→        if seq[i] == 'N' and seq[i+1] != 'P' and seq[i+2] in ('S', 'T'):
+  1411→            glycos_sites.append({
+  1412→                "resno": i + 1,  # 1-based residue number (approx, ignores gaps)
+  1413→                "motif": f"{seq[i]}{seq[i+1]}{seq[i+2]}",
+  1414→                "position": i + 1,
+  1415→            })
+  1416→    # Disorder-prone regions: stretches of >=6 consecutive charged residues
+  1417→    # (R/K/D/E) — simplified heuristic
+  1418→    charged = set('RKDE')
+  1419→    disorder_regions = []
+  1420→    i = 0
+  1421→    while i < len(seq):
+  1422→        if seq[i] in charged:
+  1423→            j = i
+  1424→            while j < len(seq) and seq[j] in charged:
+  1425→                j += 1
+  1426→            if j - i >= 6:
+  1427→                disorder_regions.append({
+  1428→                    "start": i + 1,
+  1429→                    "end": j,
+  1430→                    "length": j - i,
+  1431→                    "sequence": seq[i:j],
+  1432→                })
+  1433→            i = j
+  1434→        else:
+  1435→            i += 1
+  1436→    # Composition summary
+  1437→    from collections import Counter
+  1438→    comp = Counter(seq)
+  1439→    total = sum(comp.values())
+  1440→    composition = {aa: round(100 * cnt / total, 1) for aa, cnt in sorted(comp.items())}
+  1441→    # Hydrophobicity (Kyte-Doolittle average)
+  1442→    KD = {'A':1.8,'R':-4.5,'N':-3.5,'D':-3.5,'C':2.5,'E':-3.5,'Q':-3.5,'G':-0.4,
+  1443→          'H':-3.2,'I':4.5,'L':3.8,'K':-3.9,'M':1.9,'F':2.8,'P':-1.6,'S':-0.8,
+  1444→          'T':-0.7,'W':-0.9,'Y':-1.3,'V':4.2}
+  1445→    gravy = round(sum(KD.get(a, 0) for a in seq) / max(1, len(seq)), 3)
+  1446→    results.append({
+  1447→        "chain": c.id,
+  1448→        "sequence_length": len(seq),
+  1449→        "molecular_weight_Da": round(float(mw), 2),
+  1450→        "isoelectric_point_pI": pI,
+  1451→        "charge_at_pH_7_4": charge_74,
+  1452→        "gravy_hydrophobicity": gravy,
+  1453→        "n_glycosylation_sites": glycos_sites,
+  1454→        "n_glycosylation_count": len(glycos_sites),
+  1455→        "disorder_prone_regions": disorder_regions,
+  1456→        "disorder_residue_count": sum(r["length"] for r in disorder_regions),
+  1457→        "composition_pct": composition,
+  1458→    })
+  1459→print(json.dumps({
+  1460→    "chain_filter": chain_filter or "all",
+  1461→    "n_chains_analyzed": len(results),
+  1462→    "chains": results,
+  1463→}, ensure_ascii=False, indent=2))
+  1464→`;
+  1465→    },
+  1466→  },
+  1467→  {
+  1468→    id: "rmsd",
+  1469→    label: "RMSD 计算 (两链 CA)",
+  1470→    description:
+  1471→      "计算两条链之间 CA 原子的 RMSD（需要相同残基数，按残基号配对）",
+  1472→    requires: ["biopython"],
+  1473→    params: [
+  1474→      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+  1475→      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+  1476→    ],
+  1477→    buildScript: (inputPath, params) => {
+  1478→      const chain1 = String(params.chain1 ?? "A");
+  1479→      const chain2 = String(params.chain2 ?? "B");
+  1480→      return `${RECIPE_HEADER}
+  1481→import math
+  1482→struct = load_structure("${inputPath}")
+  1483→chain1_id = "${chain1}"
+  1484→chain2_id = "${chain2}"
+  1485→model = next(iter(struct))
+  1486→if chain1_id not in model or chain2_id not in model:
+  1487→    print(json.dumps({"error": f"chain {chain1_id} or {chain2_id} not found", "available_chains": [c.id for c in model]}))
+  1488→    raise SystemExit
+  1489→# Collect CA atoms by residue number
+  1490→ca1 = {}
+  1491→for res in model[chain1_id]:
+  1492→    if res.id[0].strip() != "":
+  1493→        continue
+  1494→    if "CA" in res:
+  1495→        ca1[res.id[1]] = res["CA"]
+  1496→ca2 = {}
+  1497→for res in model[chain2_id]:
+  1498→    if res.id[0].strip() != "":
+  1499→        continue
+  1500→    if "CA" in res:
+  1501→        ca2[res.id[1]] = res["CA"]
+  1502→# Find common residue numbers
+  1503→common = sorted(set(ca1.keys()) & set(ca2.keys()))
+  1504→if len(common) < 3:
+  1505→    print(json.dumps({"error": f"only {len(common)} common residues", "chain1_residues": len(ca1), "chain2_residues": len(ca2)}))
+  1506→    raise SystemExit
+  1507→# Compute RMSD (no superposition — raw coordinate RMSD)
+  1508→sum_sq = 0.0
+  1509→per_residue = []
+  1510→for resno in common:
+  1511→    a1 = ca1[resno]
+  1512→    a2 = ca2[resno]
+  1513→    dx = float(a1.coord[0] - a2.coord[0])
+  1514→    dy = float(a1.coord[1] - a2.coord[1])
+  1515→    dz = float(a1.coord[2] - a2.coord[2])
+  1516→    d2 = dx*dx + dy*dy + dz*dz
+  1517→    sum_sq += d2
+  1518→    per_residue.append({"resno": int(resno), "deviation_A": round(math.sqrt(d2), 2)})
+  1519→rmsd = math.sqrt(sum_sq / len(common))
+  1520→# Also compute RMSD after optimal superposition (Kabsch algorithm)
+  1521→import numpy as np
+  1522→P = np.array([ca1[r].coord for r in common])
+  1523→Q = np.array([ca2[r].coord for r in common])
+  1524→# Center
+  1525→P_c = P - P.mean(axis=0)
+  1526→Q_c = Q - Q.mean(axis=0)
+  1527→# Kabsch
+  1528→H = P_c.T @ Q_c
+  1529→U, S, Vt = np.linalg.svd(H)
+  1530→d = np.sign(np.linalg.det(Vt.T @ U.T))
+  1531→D = np.diag([1, 1, d])
+  1532→R = Vt.T @ D @ U.T
+  1533→P_rot = P_c @ R.T
+  1534→diff = P_rot - Q_c
+  1535→rmsd_aligned = math.sqrt(np.sum(diff * diff) / len(common))
+  1536→print(json.dumps({
+  1537→    "chain1": chain1_id, "chain2": chain2_id,
+  1538→    "common_residues": len(common),
+  1539→    "chain1_total": len(ca1), "chain2_total": len(ca2),
+  1540→    "rmsd_raw_A": round(float(rmsd), 3),
+  1541→    "rmsd_aligned_A": round(float(rmsd_aligned), 3),
+  1542→    "per_residue": per_residue[:30],
+  1543→}, ensure_ascii=False, indent=2))
+  1544→`;
+  1545→    },
+  1546→  },
+  1547→  {
+  1548→    id: "secondary_structure_simple",
+  1549→    label: "二级结构统计 (简化)",
+  1550→    description:
+  1551→      "通过 φ/ψ 角推断二级结构（α-helix / β-sheet / coil），统计各类型比例",
+  1552→    requires: ["biopython"],
+  1553→    params: [
+  1554→      {
+  1555→        name: "chain",
+  1556→        type: "string",
+  1557→        required: false,
+  1558→        description: "链 ID（可选，默认全部链）",
+  1559→      },
+  1560→    ],
+  1561→    buildScript: (inputPath, params) => {
+  1562→      const chain = String(params.chain ?? "");
+  1563→      return `${RECIPE_HEADER}
+  1564→from Bio.PDB import PPBuilder
+  1565→import math
+  1566→struct = load_structure("${inputPath}")
+  1567→chain_filter = "${chain}"
+  1568→model = next(iter(struct))
+  1569→ppb = PPBuilder()
+  1570→ss_counts = {"alpha_helix": 0, "beta_sheet": 0, "coil": 0, "turn": 0}
+  1571→total = 0
+  1572→residue_ss = []
+  1573→for pp in ppb.build_peptides(model):
+  1574→    if chain_filter and pp[0].get_parent().id != chain_filter:
+  1575→        continue
+  1576→    try:
+  1577→        phipsi = list(pp.get_phi_psi_list())
+  1578→    except Exception:
+  1579→        continue
+  1580→    for i, (phi, psi) in enumerate(phipsi):
+  1581→        if phi is None or psi is None:
+  1582→            ss_counts["coil"] += 1
+  1583→            total += 1
+  1584→            continue
+  1585→        phi_d = math.degrees(phi)
+  1586→        psi_d = math.degrees(psi)
+  1587→        ss = "coil"
+  1588→        # Alpha-helix: phi ~ -60, psi ~ -45
+  1589→        if -90 <= phi_d <= -30 and -75 <= psi_d <= 15:
+  1590→            ss = "alpha_helix"
+  1591→        # Beta-sheet: phi ~ -120, psi ~ 130
+  1592→        elif -180 <= phi_d <= -60 and 90 <= psi_d <= 180:
+  1593→            ss = "beta_sheet"
+  1594→        # Turn: phi ~ -60, psi ~ 30-90
+  1595→        elif -90 <= phi_d <= 0 and 0 <= psi_d <= 90:
+  1596→            ss = "turn"
+  1597→        ss_counts[ss] += 1
+  1598→        total += 1
+  1599→        try:
+  1600→            res_obj = pp[i]
+  1601→            residue_ss.append({
+  1602→                "chain": pp[0].get_parent().id,
+  1603→                "resno": int(res_obj.id[1]),
+  1604→                "resname": res_obj.resname,
+  1605→                "phi": round(phi_d, 1),
+  1606→                "psi": round(psi_d, 1),
+  1607→                "ss": ss,
+  1608→            })
+  1609→        except Exception:
+  1610→            pass
+  1611→print(json.dumps({
+  1612→    "total_residues": total,
+  1613→    "ss_counts": ss_counts,
+  1614→    "alpha_helix_pct": round(100 * ss_counts["alpha_helix"] / max(1, total), 1),
+  1615→    "beta_sheet_pct": round(100 * ss_counts["beta_sheet"] / max(1, total), 1),
+  1616→    "coil_pct": round(100 * ss_counts["coil"] / max(1, total), 1),
+  1617→    "turn_pct": round(100 * ss_counts["turn"] / max(1, total), 1),
+  1618→    "residues": residue_ss,
+  1619→}, ensure_ascii=False, indent=2))
+  1620→`;
+  1621→    },
+  1622→  },
+  1623→  {
+  1624→    id: "bfactor_stats",
+  1625→    label: "B-factor / pLDDT 统计",
+  1626→    description:
+  1627→      "统计每条链的 B-factor 分布（均值/最小/最大/标准差），返回分箱直方图数据 + 高柔性残基列表",
+  1628→    requires: ["biopython"],
+  1629→    params: [
+  1630→      {
+  1631→        name: "chain",
+  1632→        type: "string",
+  1633→        required: false,
+  1634→        description: "链 ID（可选，默认全部链）",
+  1635→      },
+  1636→    ],
+  1637→    buildScript: (inputPath, params) => {
+  1638→      const chain = String(params.chain ?? "");
+  1639→      return `${RECIPE_HEADER}
+  1640→import math
+  1641→struct = load_structure("${inputPath}")
+  1642→chain_filter = "${chain}"
+  1643→model = next(iter(struct))
+  1644→chain_data = {}
+  1645→for chain_obj in model:
+  1646→    if chain_filter and chain_obj.id != chain_filter:
+  1647→        continue
+  1648→    bvalues = []
+  1649→    per_residue = []
+  1650→    for res in chain_obj:
+  1651→        if res.id[0].strip() != "":
+  1652→            continue
+  1653→        res_bvals = []
+  1654→        for atom in res:
+  1655→            try:
+  1656→                bf = float(atom.bfactor)
+  1657→                bvalues.append(bf)
+  1658→                res_bvals.append(bf)
+  1659→            except Exception:
+  1660→                pass
+  1661→        if res_bvals:
+  1662→            avg = sum(res_bvals) / len(res_bvals)
+  1663→            per_residue.append({
+  1664→                'resno': int(res.id[1]),
+  1665→                'resname': res.resname,
+  1666→                'bfactor': round(avg, 2),
+  1667→            })
+  1668→    if not bvalues:
+  1669→        continue
+  1670→    n = len(bvalues)
+  1671→    mean = sum(bvalues) / n
+  1672→    mn = min(bvalues)
+  1673→    mx = max(bvalues)
+  1674→    variance = sum((b - mean) ** 2 for b in bvalues) / n
+  1675→    std = math.sqrt(variance)
+  1676→    # Histogram (10 bins from min to max)
+  1677→    bin_size = (mx - mn) / 10 if mx > mn else 1
+  1678→    bins = [0] * 10
+  1679→    for b in bvalues:
+  1680→        idx = min(int((b - mn) / bin_size), 9)
+  1681→        bins[idx] += 1
+  1682→    # High flexibility residues (B-factor > mean + 1.5*std)
+  1683→    threshold = mean + 1.5 * std
+  1684→    high_flex = [r for r in per_residue if r['bfactor'] > threshold]
+  1685→    high_flex.sort(key=lambda x: -x['bfactor'])
+  1686→    # Detect pLDDT (AlphaFold structures have B-factor = pLDDT 0-100)
+  1687→    is_plddt = mx <= 100 and mn >= 0 and mean < 100
+  1688→    chain_data[chain_obj.id] = {
+  1689→        'chain': chain_obj.id,
+  1690→        'n_atoms': n,
+  1691→        'mean': round(mean, 2),
+  1692→        'min': round(mn, 2),
+  1693→        'max': round(mx, 2),
+  1694→        'std': round(std, 2),
+  1695→        'histogram_bins': bins,
+  1696→        'histogram_bin_size': round(bin_size, 2),
+  1697→        'threshold_high_flex': round(threshold, 2),
+  1698→        'high_flexibility_residues': high_flex[:20],
+  1699→        'is_plddt': is_plddt,
+  1700→        'per_residue_count': len(per_residue),
+  1701→    }
+  1702→print(json.dumps({
+  1703→    'chains': chain_data,
+  1704→    'total_chains': len(chain_data),
+  1705→}, ensure_ascii=False, indent=2))
+  1706→`;
+  1707→    },
+  1708→  },
+  1709→  {
+  1710→    id: "cross_pdb_rmsd",
+  1711→    label: "跨 PDB RMSD 矩阵",
+  1712→    description:
+  1713→      "下载多个 PDB 结构，计算链 A 的 CA 原子两两 RMSD（Kabsch 叠合），返回 RMSD 矩阵",
+  1714→    requires: ["biopython", "numpy"],
+  1715→    params: [
+  1716→      {
+  1717→        name: "pdbIds",
+  1718→        type: "string[]",
+  1719→        required: true,
+  1720→        description: 'PDB ID 列表，如 ["1CBS","1TQN","4HHB"]',
+  1721→      },
+  1722→      {
+  1723→        name: "chain",
+  1724→        type: "string",
+  1725→        required: false,
+  1726→        description: "链 ID（默认 A）",
+  1727→      },
+  1728→    ],
+  1729→    buildScript: (_inputPath, params) => {
+  1730→      const pdbIds = JSON.stringify(params.pdbIds ?? []);
+  1731→      const chain = String(params.chain ?? "A");
+  1732→      return `
+  1733→import json, math, os, urllib.request
+  1734→import numpy as np
+  1735→from Bio.PDB import PDBParser, MMCIFParser
+  1736→
+  1737→pdb_ids = json.loads('''${pdbIds}''')
+  1738→chain_id = "${chain}"
+  1739→cache_dir = "/tmp/molcraft-analysis/pdb"
+  1740→os.makedirs(cache_dir, exist_ok=True)
+  1741→
+  1742→def download_structure(pdb_id):
+  1743→    pdb_id = pdb_id.lower()
+  1744→    pdb_path = os.path.join(cache_dir, pdb_id + ".pdb")
+  1745→    cif_path = os.path.join(cache_dir, pdb_id + ".cif")
+  1746→    if os.path.exists(pdb_path):
+  1747→        return pdb_path, "pdb"
+  1748→    if os.path.exists(cif_path):
+  1749→        return cif_path, "cif"
+  1750→    # Try PDB first
+  1751→    try:
+  1752→        url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
+  1753→        urllib.request.urlretrieve(url, pdb_path)
+  1754→        if os.path.getsize(pdb_path) > 100:
+  1755→            return pdb_path, "pdb"
+  1756→    except Exception:
+  1757→        pass
+  1758→    # Fall back to mmCIF
+  1759→    try:
+  1760→        url = f"https://files.rcsb.org/download/{pdb_id.upper()}.cif"
+  1761→        urllib.request.urlretrieve(url, cif_path)
+  1762→        return cif_path, "cif"
+  1763→    except Exception as e:
+  1764→        return None, str(e)
+  1765→
+  1766→def get_ca_atoms(pdb_id):
+  1767→    path, fmt = download_structure(pdb_id)
+  1768→    if not path:
+  1769→        return None, f"download failed: {fmt}"
+  1770→    if fmt == "cif":
+  1771→        parser = MMCIFParser(QUIET=True)
+  1772→    else:
+  1773→        parser = PDBParser(QUIET=True)
+  1774→    try:
+  1775→        struct = parser.get_structure("s", path)
+  1776→        model = next(iter(struct))
+  1777→        if chain_id not in model:
+  1778→            return None, f"chain {chain_id} not found"
+  1779→        ca = []
+  1780→        for res in model[chain_id]:
+  1781→            if res.id[0].strip() != "":
+  1782→                continue
+  1783→            if "CA" in res:
+  1784→                ca.append(res["CA"])
+  1785→        return ca, None
+  1786→    except Exception as e:
+  1787→        return None, str(e)
+  1788→
+  1789→def kabsch_rmsd(P, Q):
+  1790→    P_c = P - P.mean(axis=0)
+  1791→    Q_c = Q - Q.mean(axis=0)
+  1792→    H = P_c.T @ Q_c
+  1793→    U, S, Vt = np.linalg.svd(H)
+  1794→    d = np.sign(np.linalg.det(Vt.T @ U.T))
+  1795→    D = np.diag([1, 1, d])
+  1796→    R = Vt.T @ D @ U.T
+  1797→    P_rot = P_c @ R.T
+  1798→    diff = P_rot - Q_c
+  1799→    return math.sqrt(np.sum(diff * diff) / len(P))
+  1800→
+  1801→# Download all structures
+  1802→structures = {}
+  1803→errors = {}
+  1804→for pid in pdb_ids:
+  1805→    ca, err = get_ca_atoms(pid)
+  1806→    if err:
+  1807→        errors[pid] = err
+  1808→    else:
+  1809→        structures[pid] = ca
+  1810→
+  1811→valid_ids = list(structures.keys())
+  1812→if len(valid_ids) < 2:
+  1813→    print(json.dumps({"error": "need at least 2 valid structures", "errors": errors}))
+  1814→    raise SystemExit
+  1815→
+  1816→# Compute pairwise RMSD (using minimum common residue count)
+  1817→n = len(valid_ids)
+  1818→matrix = [[0.0] * n for _ in range(n)]
+  1819→for i in range(n):
+  1820→    for j in range(i + 1, n):
+  1821→        ca1 = structures[valid_ids[i]]
+  1822→        ca2 = structures[valid_ids[j]]
+  1823→        # Match by residue number
+  1824→        resnos1 = {r.id[1]: idx for idx, r in enumerate(ca1)}
+  1825→        resnos2 = {r.id[1]: idx for idx, r in enumerate(ca2)}
+  1826→        common = sorted(set(resnos1.keys()) & set(resnos2.keys()))
+  1827→        if len(common) < 3:
+  1828→            matrix[i][j] = -1
+  1829→            matrix[j][i] = -1
+  1830→            continue
+  1831→        P = np.array([ca1[resnos1[r]].coord for r in common], dtype=float)
+  1832→        Q = np.array([ca2[resnos2[r]].coord for r in common], dtype=float)
+  1833→        rmsd = kabsch_rmsd(P, Q)
+  1834→        matrix[i][j] = round(rmsd, 3)
+  1835→        matrix[j][i] = round(rmsd, 3)
+  1836→
+  1837→print(json.dumps({
+  1838→    "pdb_ids": valid_ids,
+  1839→    "chain": chain_id,
+  1840→    "matrix": matrix,
+  1841→    "errors": errors,
+  1842→    "common_residues_note": "RMSD computed on CA atoms of common residue numbers",
+  1843→}, ensure_ascii=False, indent=2))
+  1844→`;
+  1845→    },
+  1846→  },
+  1847→  {
+  1848→    id: "cross_pdb_rmsd_aligned",
+  1849→    label: "序列对齐驱动的跨 PDB RMSD",
+  1850→    description:
+  1851→      "下载多个 PDB，先用序列比对匹配残基，再计算 CA 原子两两 Kabsch 叠合 RMSD（解决残基编号不匹配问题）",
+  1852→    requires: ["biopython", "numpy"],
+  1853→    params: [
+  1854→      {
+  1855→        name: "pdbIds",
+  1856→        type: "string[]",
+  1857→        required: true,
+  1858→        description: 'PDB ID 列表，如 ["1CBS","1CBR"]',
+  1859→      },
+  1860→      {
+  1861→        name: "chain",
+  1862→        type: "string",
+  1863→        required: false,
+  1864→        description: "链 ID（默认 A）",
+  1865→      },
+  1866→    ],
+  1867→    buildScript: (_inputPath, params) => {
+  1868→      const pdbIds = JSON.stringify(params.pdbIds ?? []);
+  1869→      const chain = String(params.chain ?? "A");
+  1870→      return `
+  1871→import json, math, os, urllib.request
+  1872→import numpy as np
+  1873→from Bio import pairwise2
+  1874→from Bio.PDB import PDBParser, MMCIFParser, PPBuilder
+  1875→from Bio.SeqUtils import seq1
+  1876→
+  1877→pdb_ids = json.loads('''${pdbIds}''')
+  1878→chain_id = "${chain}"
+  1879→cache_dir = "/tmp/molcraft-analysis/pdb"
+  1880→os.makedirs(cache_dir, exist_ok=True)
+  1881→
+  1882→def download_structure(pdb_id):
+  1883→    pdb_id = pdb_id.lower()
+  1884→    pdb_path = os.path.join(cache_dir, pdb_id + ".pdb")
+  1885→    cif_path = os.path.join(cache_dir, pdb_id + ".cif")
+  1886→    if os.path.exists(pdb_path):
+  1887→        return pdb_path, "pdb"
+  1888→    if os.path.exists(cif_path):
+  1889→        return cif_path, "cif"
+  1890→    try:
+  1891→        url = f"https://files.rcsb.org/download/{pdb_id.upper()}.pdb"
+  1892→        urllib.request.urlretrieve(url, pdb_path)
+  1893→        if os.path.getsize(pdb_path) > 100:
+  1894→            return pdb_path, "pdb"
+  1895→    except Exception:
+  1896→        pass
+  1897→    try:
+  1898→        url = f"https://files.rcsb.org/download/{pdb_id.upper()}.cif"
+  1899→        urllib.request.urlretrieve(url, cif_path)
+  1900→        return cif_path, "cif"
+  1901→    except Exception as e:
+  1902→        return None, str(e)
+  1903→
+  1904→def get_chain_data(pdb_id):
+  1905→    """Return (sequence, ca_atoms_by_resno) for the chain."""
+  1906→    path, fmt = download_structure(pdb_id)
+  1907→    if not path:
+  1908→        return None, None, f"download failed: {fmt}"
+  1909→    if fmt == "cif":
+  1910→        parser = MMCIFParser(QUIET=True)
+  1911→    else:
+  1912→        parser = PDBParser(QUIET=True)
+  1913→    try:
+  1914→        struct = parser.get_structure("s", path)
+  1915→        model = next(iter(struct))
+  1916→        if chain_id not in model:
+  1917→            return None, None, f"chain {chain_id} not found"
+  1918→        ca_by_resno = {}
+  1919→        ppb = PPBuilder()
+  1920→        seq = ""
+  1921→        for pp in ppb.build_peptides(model[chain_id]):
+  1922→            seq = "".join(seq1(r.resname) for r in pp)
+  1923→            break
+  1924→        for res in model[chain_id]:
+  1925→            if res.id[0].strip() != "":
+  1926→                continue
+  1927→            if "CA" in res:
+  1928→                ca_by_resno[res.id[1]] = res["CA"]
+  1929→        return seq, ca_by_resno, None
+  1930→    except Exception as e:
+  1931→        return None, None, str(e)
+  1932→
+  1933→# Download all structures
+  1934→structures = {}
+  1935→errors = {}
+  1936→for pid in pdb_ids:
+  1937→    seq, ca, err = get_chain_data(pid)
+  1938→    if err:
+  1939→        errors[pid] = err
+  1940→    else:
+  1941→        structures[pid] = {"seq": seq, "ca": ca}
+  1942→
+  1943→valid_ids = list(structures.keys())
+  1944→if len(valid_ids) < 2:
+  1945→    print(json.dumps({"error": "need at least 2 valid structures", "errors": errors}))
+  1946→    raise SystemExit
+  1947→
+  1948→# For each pair, do sequence alignment and match CA atoms by alignment position
+  1949→def kabsch_rmsd(P, Q):
+  1950→    P_c = P - P.mean(axis=0)
+  1951→    Q_c = Q - Q.mean(axis=0)
+  1952→    H = P_c.T @ Q_c
+  1953→    U, S, Vt = np.linalg.svd(H)
+  1954→    d = np.sign(np.linalg.det(Vt.T @ U.T))
+  1955→    D = np.diag([1, 1, d])
+  1956→    R = Vt.T @ D @ U.T
+  1957→    P_rot = P_c @ R.T
+  1958→    diff = P_rot - Q_c
+  1959→    return math.sqrt(np.sum(diff * diff) / len(P))
+  1960→
+  1961→def aligned_rmsd(id1, id2):
+  1962→    s1 = structures[id1]["seq"]
+  1963→    s2 = structures[id2]["seq"]
+  1964→    ca1 = structures[id1]["ca"]
+  1965→    ca2 = structures[id2]["ca"]
+  1966→    if not s1 or not s2:
+  1967→        return -1, 0, "no sequence"
+  1968→    # Global alignment
+  1969→    alignments = pairwise2.align.globalms(s1, s2, 2, -1, -2, -0.5, one_alignment_only=True)
+  1970→    if not alignments:
+  1971→        return -1, 0, "alignment failed"
+  1972→    aln = alignments[0]
+  1973→    # Walk the alignment and collect matched residue numbers
+  1974→    resnos1 = sorted(ca1.keys())
+  1975→    resnos2 = sorted(ca2.keys())
+  1976→    # Map sequence position → resno (1-indexed within sequence)
+  1977→    # The sequence from PPBuilder is in residue order, so position i → resnos1[i]
+  1978→    matched_pairs = []
+  1979→    i1 = 0  # index into resnos1
+  1980→    i2 = 0  # index into resnos2
+  1981→    for a, b in zip(aln.seqA, aln.seqB):
+  1982→        if a == "-" and b == "-":
+  1983→            continue
+  1984→        r1 = None
+  1985→        r2 = None
+  1986→        if a != "-":
+  1987→            if i1 < len(resnos1):
+  1988→                r1 = resnos1[i1]
+  1989→            i1 += 1
+  1990→        if b != "-":
+  1991→            if i2 < len(resnos2):
+  1992→                r2 = resnos2[i2]
+  1993→            i2 += 1
+  1994→        if r1 is not None and r2 is not None:
+  1995→            matched_pairs.append((r1, r2))
+  1996→    if len(matched_pairs) < 3:
+  1997→        return -1, len(matched_pairs), "too few matched residues"
+  1998→    P = np.array([ca1[r1].coord for r1, r2 in matched_pairs], dtype=float)
+  1999→    Q = np.array([ca2[r2].coord for r1, r2 in matched_pairs], dtype=float)
+  2000→    rmsd = kabsch_rmsd(P, Q)
+
+[showing lines 1-2000 of 3843; use offset=2001 with limit to continue reading]

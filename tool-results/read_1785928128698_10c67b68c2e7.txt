@@ -1,0 +1,968 @@
+     1→"use client";
+     2→
+     3→import { useEffect, useState, useCallback, useRef } from "react";
+     4→import { Button } from "@/components/ui/button";
+     5→import { Badge } from "@/components/ui/badge";
+     6→import { Skeleton } from "@/components/ui/skeleton";
+     7→import {
+     8→  LayoutDashboard,
+     9→  RefreshCw,
+    10→  Loader2,
+    11→  Info,
+    12→  Microscope,
+    13→  Activity,
+    14→  Box,
+    15→  Zap,
+    16→  Link2,
+    17→  SunMedium,
+    18→  FlaskConical,
+    19→  Layers,
+    20→  Download,
+    21→  Camera,
+    22→} from "lucide-react";
+    23→import { useAppStore, selectActiveStructure } from "@/lib/store";
+    24→import {
+    25→  Popover,
+    26→  PopoverContent,
+    27→  PopoverTrigger,
+    28→} from "@/components/ui/popover";
+    29→
+    30→// ===== Types for each analysis result =====
+    31→interface SummaryData {
+    32→  chain_count: number;
+    33→  chains: Record<string, { residue_count: number; first_resno: number | null; last_resno: number | null; atom_count: number }>;
+    34→  total_residues: number;
+    35→  total_atoms: number;
+    36→  ligands: Record<string, number>;
+    37→  has_hydrogens: boolean;
+    38→}
+    39→
+    40→interface RamaData {
+    41→  total_residues: number;
+    42→  favoured_pct: number;
+    43→  outlier_pct: number;
+    44→  regions: Record<string, number>;
+    45→}
+    46→
+    47→interface SsData {
+    48→  total_residues: number;
+    49→  ss_counts: { alpha_helix: number; beta_sheet: number; coil: number; turn: number };
+    50→  alpha_helix_pct: number;
+    51→  beta_sheet_pct: number;
+    52→  coil_pct: number;
+    53→  turn_pct: number;
+    54→}
+    55→
+    56→interface BfactorData {
+    57→  total_chains: number;
+    58→  chains: Record<string, { mean: number; min: number; max: number; std: number; is_plddt: boolean }>;
+    59→}
+    60→
+    61→interface SasaData {
+    62→  total_sasa_A2: number;
+    63→  chain_sasa_A2: Record<string, number>;
+    64→  n_chains: number;
+    65→}
+    66→
+    67→interface DisulfideData {
+    68→  count: number;
+    69→  bonds: Array<{ chain1: string; resno1: number; chain2: string; resno2: number; distance_A: number }>;
+    70→  cutoff: number;
+    71→}
+    72→
+    73→interface OligomerData {
+    74→  n_chains: number;
+    75→  oligomer_type: string;
+    76→  is_homomer: boolean;
+    77→  n_interfaces: number;
+    78→  chains: Array<{ chain: string; residue_count: number; atom_count: number }>;
+    79→  interfaces: Array<{ chain1: string; chain2: string; contact_atoms: number; min_distance_A: number }>;
+    80→}
+    81→
+    82→interface ValidationData {
+    83→  quality: "good" | "fair" | "poor";
+    84→  clash_count: number;
+    85→  rama_outlier_count: number;
+    86→  rama_outlier_pct: number;
+    87→  missing_sidechain_count: number;
+    88→}
+    89→
+    90→interface OverviewState {
+    91→  summary: SummaryData | null;
+    92→  rama: RamaData | null;
+    93→  ss: SsData | null;
+    94→  bfactor: BfactorData | null;
+    95→  sasa: SasaData | null;
+    96→  disulfide: DisulfideData | null;
+    97→  oligomer: OligomerData | null;
+    98→  validation: ValidationData | null;
+    99→  errors: string[];
+   100→  loaded: boolean;
+   101→}
+   102→
+   103→const INITIAL_STATE: OverviewState = {
+   104→  summary: null,
+   105→  rama: null,
+   106→  ss: null,
+   107→  bfactor: null,
+   108→  sasa: null,
+   109→  disulfide: null,
+   110→  oligomer: null,
+   111→  validation: null,
+   112→  errors: [],
+   113→  loaded: false,
+   114→};
+   115→
+   116→const QUALITY_META: Record<string, { label: string; color: string; bg: string }> = {
+   117→  good: { label: "优秀", color: "#059669", bg: "#05966920" },
+   118→  fair: { label: "一般", color: "#f59e0b", bg: "#f59e0b20" },
+   119→  poor: { label: "较差", color: "#ef4444", bg: "#ef444420" },
+   120→};
+   121→
+   122→const SS_COLORS: Record<string, string> = {
+   123→  alpha_helix: "#10b981",
+   124→  beta_sheet: "#3b82f6",
+   125→  turn: "#f59e0b",
+   126→  coil: "#9ca3af",
+   127→};
+   128→
+   129→const SS_LABELS: Record<string, string> = {
+   130→  alpha_helix: "α-螺旋",
+   131→  beta_sheet: "β-折叠",
+   132→  turn: "转角",
+   133→  coil: "卷曲",
+   134→};
+   135→
+   136→export function StructureOverviewDashboard() {
+   137→  const activeStructure = useAppStore(selectActiveStructure);
+   138→  const structureFileCache = useAppStore((s) => s.structureFileCache);
+   139→  const toast = useAppStore((s) => s.toast);
+   140→  const viewer = useAppStore((s) => s.viewer);
+   141→  const [state, setState] = useState<OverviewState>(INITIAL_STATE);
+   142→  const [loading, setLoading] = useState(false);
+   143→  const [progress, setProgress] = useState(0);
+   144→  const progressRef = useRef(0);
+   145→
+   146→  const activeId = activeStructure?.id;
+   147→  const isPdbId = activeId ? /^[a-zA-Z0-9]{4}$/.test(activeId) : false;
+   148→  const hasFileCache = activeId ? !!structureFileCache[activeId] : false;
+   149→
+   150→  const fetchAll = useCallback(async () => {
+   151→    if (!activeId) {
+   152→      setState(INITIAL_STATE);
+   153→      return;
+   154→    }
+   155→
+   156→    const body: Record<string, unknown> = {};
+   157→    if (isPdbId) {
+   158→      body.pdbId = activeId;
+   159→    } else if (hasFileCache) {
+   160→      body.fileContent = structureFileCache[activeId].content;
+   161→      body.fileFormat = structureFileCache[activeId].format;
+   162→    } else {
+   163→      setState({
+   164→        ...INITIAL_STATE,
+   165→        errors: [`当前结构 (${activeId}) 不是 PDB ID 且无本地文件缓存，无法生成概览。`],
+   166→      });
+   167→      return;
+   168→    }
+   169→
+   170→    setLoading(true);
+   171→    setProgress(0);
+   172→    progressRef.current = 0;
+   173→    setState({ ...INITIAL_STATE, loaded: false });
+   174→
+   175→    const recipes = [
+   176→      { key: "summary" as const, recipe: "summary" },
+   177→      { key: "rama" as const, recipe: "ramachandran" },
+   178→      { key: "ss" as const, recipe: "secondary_structure_simple" },
+   179→      { key: "bfactor" as const, recipe: "bfactor_stats" },
+   180→      { key: "sasa" as const, recipe: "sasa" },
+   181→      { key: "disulfide" as const, recipe: "disulfide_bonds" },
+   182→      { key: "oligomer" as const, recipe: "oligomer_analysis" },
+   183→      { key: "validation" as const, recipe: "structure_validation" },
+   184→    ];
+   185→
+   186→    const errors: string[] = [];
+   187→    const results: Partial<OverviewState> = {};
+   188→
+   189→    // Run all recipes in parallel for speed
+   190→    await Promise.all(
+   191→      recipes.map(async ({ key, recipe }) => {
+   192→        try {
+   193→          const res = await fetch("/api/analyze/run", {
+   194→            method: "POST",
+   195→            headers: { "Content-Type": "application/json" },
+   196→            body: JSON.stringify({ ...body, recipe }),
+   197→          });
+   198→          if (!res.ok) {
+   199→            const err = await res.json().catch(() => ({}));
+   200→            throw new Error(err.detail || err.error || `HTTP ${res.status}`);
+   201→          }
+   202→          const json = await res.json();
+   203→          if (json.data) {
+   204→            if (json.data.error) {
+   205→              errors.push(`${recipe}: ${json.data.error}`);
+   206→            } else {
+   207→              results[key] = json.data;
+   208→            }
+   209→          } else {
+   210→            errors.push(`${recipe}: 无数据`);
+   211→          }
+   212→        } catch (err) {
+   213→          const msg = err instanceof Error ? err.message : String(err);
+   214→          errors.push(`${recipe}: ${msg}`);
+   215→        }
+   216→        progressRef.current += 1;
+   217→        setProgress(Math.round((progressRef.current / recipes.length) * 100));
+   218→      })
+   219→    );
+   220→
+   221→    setState({
+   222→      ...(results as OverviewState),
+   223→      errors,
+   224→      loaded: true,
+   225→    });
+   226→    setLoading(false);
+   227→    if (errors.length > 0 && errors.length < recipes.length) {
+   228→      toast(`概览完成 (${recipes.length - errors.length}/${recipes.length} 成功)`, "info");
+   229→    } else if (errors.length === 0) {
+   230→      toast("概览分析完成", "success");
+   231→    } else {
+   232→      toast(`概览失败: ${errors.length} 项错误`, "error");
+   233→    }
+   234→  }, [activeId, isPdbId, hasFileCache, structureFileCache, toast]);
+   235→
+   236→  useEffect(() => {
+   237→    fetchAll();
+   238→  }, [fetchAll]);
+   239→
+   240→  /** Export all analysis results as a markdown report */
+   241→  const handleExport = useCallback(() => {
+   242→    if (!state.loaded || !activeId) return;
+   243→    const label = activeStructure?.label ?? activeId;
+   244→    const lines: string[] = [];
+   245→    lines.push(`# 结构概览报告: ${label}`);
+   246→    lines.push("");
+   247→    lines.push(`> 生成时间: ${new Date().toLocaleString("zh-CN")}`);
+   248→    lines.push(`> 分析项: 8 项并行 (摘要 / Ramachandran / 二级结构 / B-factor / SASA / 二硫键 / 寡聚体 / 验证)`);
+   249→    lines.push("");
+   250→
+   251→    // Summary
+   252→    if (state.summary) {
+   253→      lines.push("## 1. 结构摘要");
+   254→      lines.push("");
+   255→      lines.push(`- **链数**: ${state.summary.chain_count}`);
+   256→      lines.push(`- **总残基数**: ${state.summary.total_residues}`);
+   257→      lines.push(`- **总原子数**: ${state.summary.total_atoms}`);
+   258→      lines.push(`- **含氢原子**: ${state.summary.has_hydrogens ? "是" : "否"}`);
+   259→      if (Object.keys(state.summary.ligands).length > 0) {
+   260→        lines.push(`- **配体**: ${Object.entries(state.summary.ligands).map(([k, v]) => `${k}${v > 1 ? `×${v}` : ""}`).join(", ")}`);
+   261→      }
+   262→      lines.push("");
+   263→      lines.push("### 链详情");
+   264→      lines.push("");
+   265→      lines.push("| 链 | 残基数 | 原子数 | 范围 |");
+   266→      lines.push("|---|---|---|---|");
+   267→      for (const [chain, info] of Object.entries(state.summary.chains)) {
+   268→        lines.push(`| ${chain} | ${info.residue_count} | ${info.atom_count} | ${info.first_resno}-${info.last_resno} |`);
+   269→      }
+   270→      lines.push("");
+   271→    }
+   272→
+   273→    // Validation
+   274→    if (state.validation) {
+   275→      lines.push("## 2. 结构质量验证");
+   276→      lines.push("");
+   277→      lines.push(`- **质量评分**: ${QUALITY_META[state.validation.quality].label}`);
+   278→      lines.push(`- **原子碰撞数**: ${state.validation.clash_count}`);
+   279→      lines.push(`- **Ramachandran 异常率**: ${state.validation.rama_outlier_pct}% (${state.validation.rama_outlier_count}/${state.validation.total_phi_psi})`);
+   280→      lines.push(`- **缺失侧链数**: ${state.validation.missing_sidechain_count}`);
+   281→      lines.push("");
+   282→    }
+   283→
+   284→    // Ramachandran
+   285→    if (state.rama) {
+   286→      lines.push("## 3. Ramachandran 分析");
+   287→      lines.push("");
+   288→      lines.push(`- **总残基数**: ${state.rama.total_residues}`);
+   289→      lines.push(`- **偏好区**: ${state.rama.favoured_pct}%`);
+   290→      lines.push(`- **异常区**: ${state.rama.outlier_pct}%`);
+   291→      lines.push("");
+   292→    }
+   293→
+   294→    // Secondary structure
+   295→    if (state.ss) {
+   296→      lines.push("## 4. 二级结构组成");
+   297→      lines.push("");
+   298→      lines.push(`- **总残基数**: ${state.ss.total_residues}`);
+   299→      lines.push(`- **α-螺旋**: ${state.ss.alpha_helix_pct}% (${state.ss.ss_counts.alpha_helix} 残基)`);
+   300→      lines.push(`- **β-折叠**: ${state.ss.beta_sheet_pct}% (${state.ss.ss_counts.beta_sheet} 残基)`);
+   301→      lines.push(`- **转角**: ${state.ss.turn_pct}% (${state.ss.ss_counts.turn} 残基)`);
+   302→      lines.push(`- **无规卷曲**: ${state.ss.coil_pct}% (${state.ss.ss_counts.coil} 残基)`);
+   303→      lines.push("");
+   304→    }
+   305→
+   306→    // B-factor
+   307→    if (state.bfactor) {
+   308→      lines.push("## 5. B-factor / pLDDT 统计");
+   309→      lines.push("");
+   310→      lines.push("| 链 | 均值 | 最小 | 最大 | 标准差 | 类型 |");
+   311→      lines.push("|---|---|---|---|---|---|");
+   312→      for (const [chain, info] of Object.entries(state.bfactor.chains)) {
+   313→        lines.push(`| ${chain} | ${info.mean} | ${info.min} | ${info.max} | ${info.std} | ${info.is_plddt ? "pLDDT" : "B-factor"} |`);
+   314→      }
+   315→      lines.push("");
+   316→    }
+   317→
+   318→    // SASA
+   319→    if (state.sasa) {
+   320→      lines.push("## 6. 溶剂可及表面积 (SASA)");
+   321→      lines.push("");
+   322→      lines.push(`- **总 SASA**: ${state.sasa.total_sasa_A2.toFixed(2)} Å²`);
+   323→      lines.push(`- **链数**: ${state.sasa.n_chains}`);
+   324→      lines.push("");
+   325→      lines.push("| 链 | SASA (Å²) | 占比 |");
+   326→      lines.push("|---|---|---|");
+   327→      for (const [chain, sasa] of Object.entries(state.sasa.chain_sasa_A2)) {
+   328→        const pct = (sasa / state.sasa.total_sasa_A2) * 100;
+   329→        lines.push(`| ${chain} | ${sasa.toFixed(2)} | ${pct.toFixed(1)}% |`);
+   330→      }
+   331→      lines.push("");
+   332→    }
+   333→
+   334→    // Disulfide bonds
+   335→    if (state.disulfide) {
+   336→      lines.push("## 7. 二硫键");
+   337→      lines.push("");
+   338→      lines.push(`- **检测数**: ${state.disulfide.count} (截断 ${state.disulfide.cutoff} Å)`);
+   339→      if (state.disulfide.bonds.length > 0) {
+   340→        lines.push("");
+   341→        lines.push("| 残基 1 | 残基 2 | 距离 (Å) |");
+   342→        lines.push("|---|---|---|");
+   343→        for (const bond of state.disulfide.bonds) {
+   344→          lines.push(`| CYS${bond.resno1} (${bond.chain1}) | CYS${bond.resno2} (${bond.chain2}) | ${bond.distance_A.toFixed(3)} |`);
+   345→        }
+   346→      }
+   347→      lines.push("");
+   348→    }
+   349→
+   350→    // Oligomer
+   351→    if (state.oligomer) {
+   352→      lines.push("## 8. 寡聚体分析");
+   353→      lines.push("");
+   354→      lines.push(`- **寡聚类型**: ${state.oligomer.oligomer_type}`);
+   355→      lines.push(`- **链数**: ${state.oligomer.n_chains}`);
+   356→      lines.push(`- **界面数**: ${state.oligomer.n_interfaces}`);
+   357→      lines.push(`- **对称性**: ${state.oligomer.is_homomer ? "同源寡聚体" : "异源寡聚体"}`);
+   358→      if (state.oligomer.interfaces.length > 0) {
+   359→        lines.push("");
+   360→        lines.push("### 链间界面");
+   361→        lines.push("");
+   362→        lines.push("| 链 1 | 链 2 | 接触原子数 | 最小距离 (Å) |");
+   363→        lines.push("|---|---|---|---|");
+   364→        for (const iface of state.oligomer.interfaces) {
+   365→          lines.push(`| ${iface.chain1} | ${iface.chain2} | ${iface.contact_atoms} | ${iface.min_distance_A.toFixed(2)} |`);
+   366→        }
+   367→      }
+   368→      lines.push("");
+   369→    }
+   370→
+   371→    // Errors
+   372→    if (state.errors.length > 0) {
+   373→      lines.push("## ⚠️ 失败的分析");
+   374→      lines.push("");
+   375→      for (const err of state.errors) {
+   376→        lines.push(`- ${err}`);
+   377→      }
+   378→      lines.push("");
+   379→    }
+   380→
+   381→    lines.push("---");
+   382→    lines.push("");
+   383→    lines.push("*报告由 MolCraft AI 自动生成 · 基于 Molstar + Biopython + FreeSASA*");
+   384→
+   385→    const md = lines.join("\n");
+   386→    const blob = new Blob([md], { type: "text/markdown;charset=utf-8" });
+   387→    const url = URL.createObjectURL(blob);
+   388→    const a = document.createElement("a");
+   389→    a.href = url;
+   390→    a.download = `overview-${label.replace(/[^\w\u4e00-\u9fa5-]+/g, "_")}.md`;
+   391→    a.click();
+   392→    URL.revokeObjectURL(url);
+   393→    toast("概览报告 (Markdown) 已导出", "success");
+   394→  }, [state, activeId, activeStructure, toast]);
+   395→
+   396→  /** Export all analysis results as a styled HTML report */
+   397→  const handleExportHtml = useCallback(() => {
+   398→    if (!state.loaded || !activeId) return;
+   399→    const label = activeStructure?.label ?? activeId;
+   400→    const date = new Date().toLocaleString("zh-CN");
+   401→    const qualityColor = state.validation ? QUALITY_META[state.validation.quality].color : "#6b7280";
+   402→    const qualityLabel = state.validation ? QUALITY_META[state.validation.quality].label : "—";
+   403→
+   404→    const card = (title: string, content: string, bg = "#f8fafc") =>
+   405→      `<div style="background:${bg};border:1px solid #e2e8f0;border-radius:8px;padding:12px;margin-bottom:12px"><h3 style="margin:0 0 8px;color:#0f766e;font-size:13px;border-bottom:1px solid #e2e8f0;padding-bottom:4px">${title}</h3>${content}</div>`;
+   406→
+   407→    const metric = (label: string, value: string, color: string) =>
+   408→      `<div style="text-align:center;padding:8px;border:1px solid #e2e8f0;border-radius:6px;background:#fff"><div style="font-size:9px;color:#64748b;text-transform:uppercase">${label}</div><div style="font-family:monospace;font-weight:bold;font-size:14px;color:${color}">${value}</div></div>`;
+   409→
+   410→    let html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>结构概览报告: ${label}</title><style>body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;max-width:900px;margin:20px auto;padding:0 16px;color:#1e293b;line-height:1.5}h1{color:#0f766e;border-bottom:2px solid #0f766e;padding-bottom:6px}h2{color:#0369a1;margin-top:20px}table{border-collapse:collapse;width:100%;font-size:12px}th,td{border:1px solid #cbd5e1;padding:4px 8px;text-align:left}th{background:#f1f5f9}.meta{color:#64748b;font-size:11px}</style></head><body>`;
+   411→    html += `<h1>🔬 结构概览报告: ${label}</h1><p class="meta">生成时间: ${date} · MolCraft AI · 8 项并行分析</p>`;
+   412→
+   413→    // Identity + Quality
+   414→    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">';
+   415→    if (state.summary) {
+   416→      html += card("结构标识", `<div style="font-family:monospace;font-size:16px;font-weight:bold">${label}</div><div style="font-size:11px;color:#64748b">${state.summary.chain_count} 链 · ${state.summary.total_residues} 残基 · ${state.summary.total_atoms} 原子</div>`, "#ecfdf5");
+   417→    }
+   418→    if (state.validation) {
+   419→      html += card("质量评分", `<div style="font-size:16px;font-weight:bold;color:${qualityColor}">${qualityLabel}</div><div style="font-size:11px;color:#64748b">碰撞 ${state.validation.clash_count} · 拉氏异常 ${state.validation.rama_outlier_pct}% · 缺侧链 ${state.validation.missing_sidechain_count}</div>`, qualityColor + "15");
+   420→    }
+   421→    html += '</div>';
+   422→
+   423→    // Key metrics
+   424→    html += '<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:12px">';
+   425→    if (state.rama) html += metric("偏好区", `${state.rama.favoured_pct}%`, "#10b981");
+   426→    if (state.ss) html += metric("α/β 比", `${state.ss.alpha_helix_pct}/${state.ss.beta_sheet_pct}`, "#3b82f6");
+   427→    if (state.bfactor) {
+   428→      const first = Object.values(state.bfactor.chains)[0];
+   429→      html += metric("B 均值", first ? first.mean.toFixed(1) : "—", "#8b5cf6");
+   430→    }
+   431→    if (state.sasa) html += metric("总 SASA", `${(state.sasa.total_sasa_A2 / 1000).toFixed(1)}k`, "#06b6d4");
+   432→    html += '</div>';
+   433→
+   434→    // Summary
+   435→    if (state.summary) {
+   436→      let table = '<table><thead><tr><th>链</th><th>残基</th><th>原子</th><th>范围</th></tr></thead><tbody>';
+   437→      for (const [chain, info] of Object.entries(state.summary.chains)) {
+   438→        table += `<tr><td><b>${chain}</b></td><td>${info.residue_count}</td><td>${info.atom_count}</td><td>${info.first_resno}-${info.last_resno}</td></tr>`;
+   439→      }
+   440→      table += '</tbody></table>';
+   441→      const ligands = Object.keys(state.summary.ligands).length > 0
+   442→        ? `<p><b>配体:</b> ${Object.entries(state.summary.ligands).map(([k, v]) => `${k}${v > 1 ? `×${v}` : ""}`).join(", ")}</p>`
+   443→        : "";
+   444→      html += card("1. 结构摘要", `<p><b>链数:</b> ${state.summary.chain_count} · <b>总残基:</b> ${state.summary.total_residues} · <b>总原子:</b> ${state.summary.total_atoms} · <b>含氢:</b> ${state.summary.has_hydrogens ? "是" : "否"}</p>${ligands}${table}`);
+   445→    }
+   446→
+   447→    // Validation
+   448→    if (state.validation) {
+   449→      html += card("2. 结构质量验证", `<p><b>质量评分:</b> <span style="color:${qualityColor};font-weight:bold">${qualityLabel}</span></p><p><b>原子碰撞:</b> ${state.validation.clash_count} · <b>Ramachandran 异常:</b> ${state.validation.rama_outlier_pct}% (${state.validation.rama_outlier_count}/${state.validation.total_phi_psi}) · <b>缺失侧链:</b> ${state.validation.missing_sidechain_count}</p>`);
+   450→    }
+   451→
+   452→    // Ramachandran
+   453→    if (state.rama) {
+   454→      html += card("3. Ramachandran 分析", `<p><b>总残基:</b> ${state.rama.total_residues} · <b>偏好区:</b> ${state.rama.favoured_pct}% · <b>异常区:</b> ${state.rama.outlier_pct}%</p>`);
+   455→    }
+   456→
+   457→    // Secondary structure
+   458→    if (state.ss) {
+   459→      html += card("4. 二级结构组成", `<p><b>α-螺旋:</b> ${state.ss.alpha_helix_pct}% (${state.ss.ss_counts.alpha_helix}) · <b>β-折叠:</b> ${state.ss.beta_sheet_pct}% (${state.ss.ss_counts.beta_sheet}) · <b>转角:</b> ${state.ss.turn_pct}% (${state.ss.ss_counts.turn}) · <b>卷曲:</b> ${state.ss.coil_pct}% (${state.ss.ss_counts.coil})</p>`);
+   460→    }
+   461→
+   462→    // B-factor
+   463→    if (state.bfactor) {
+   464→      let table = '<table><thead><tr><th>链</th><th>均值</th><th>最小</th><th>最大</th><th>标准差</th><th>类型</th></tr></thead><tbody>';
+   465→      for (const [chain, info] of Object.entries(state.bfactor.chains)) {
+   466→        table += `<tr><td><b>${chain}</b></td><td>${info.mean}</td><td>${info.min}</td><td>${info.max}</td><td>${info.std}</td><td>${info.is_plddt ? "pLDDT" : "B-factor"}</td></tr>`;
+   467→      }
+   468→      table += '</tbody></table>';
+   469→      html += card("5. B-factor / pLDDT 统计", table);
+   470→    }
+   471→
+   472→    // SASA
+   473→    if (state.sasa) {
+   474→      let table = '<table><thead><tr><th>链</th><th>SASA (Å²)</th><th>占比</th></tr></thead><tbody>';
+   475→      for (const [chain, sasa] of Object.entries(state.sasa.chain_sasa_A2)) {
+   476→        table += `<tr><td><b>${chain}</b></td><td>${sasa.toFixed(2)}</td><td>${((sasa / state.sasa.total_sasa_A2) * 100).toFixed(1)}%</td></tr>`;
+   477→      }
+   478→      table += '</tbody></table>';
+   479→      html += card("6. 溶剂可及表面积 (SASA)", `<p><b>总 SASA:</b> ${state.sasa.total_sasa_A2.toFixed(2)} Å² · <b>链数:</b> ${state.sasa.n_chains}</p>${table}`);
+   480→    }
+   481→
+   482→    // Disulfide
+   483→    if (state.disulfide) {
+   484→      let content = `<p><b>检测数:</b> ${state.disulfide.count} (截断 ${state.disulfide.cutoff} Å)</p>`;
+   485→      if (state.disulfide.bonds.length > 0) {
+   486→        let table = '<table><thead><tr><th>残基 1</th><th>残基 2</th><th>距离 (Å)</th></tr></thead><tbody>';
+   487→        for (const bond of state.disulfide.bonds) {
+   488→          table += `<tr><td>CYS${bond.resno1} (${bond.chain1})</td><td>CYS${bond.resno2} (${bond.chain2})</td><td>${bond.distance_A.toFixed(3)}</td></tr>`;
+   489→        }
+   490→        table += '</tbody></table>';
+   491→        content += table;
+   492→      }
+   493→      html += card("7. 二硫键", content);
+   494→    }
+   495→
+   496→    // Oligomer
+   497→    if (state.oligomer) {
+   498→      let content = `<p><b>寡聚类型:</b> ${state.oligomer.oligomer_type} · <b>链数:</b> ${state.oligomer.n_chains} · <b>界面数:</b> ${state.oligomer.n_interfaces} · <b>对称性:</b> ${state.oligomer.is_homomer ? "同源" : "异源"}</p>`;
+   499→      if (state.oligomer.interfaces.length > 0) {
+   500→        let table = '<table><thead><tr><th>链 1</th><th>链 2</th><th>接触原子数</th><th>最小距离 (Å)</th></tr></thead><tbody>';
+   501→        for (const iface of state.oligomer.interfaces) {
+   502→          table += `<tr><td><b>${iface.chain1}</b></td><td><b>${iface.chain2}</b></td><td>${iface.contact_atoms}</td><td>${iface.min_distance_A.toFixed(2)}</td></tr>`;
+   503→        }
+   504→        table += '</tbody></table>';
+   505→        content += table;
+   506→      }
+   507→      html += card("8. 寡聚体分析", content);
+   508→    }
+   509→
+   510→    // Errors
+   511→    if (state.errors.length > 0) {
+   512→      let content = '<ul>';
+   513→      for (const err of state.errors) {
+   514→        content += `<li style="font-family:monospace;font-size:11px">${err}</li>`;
+   515→      }
+   516→      content += '</ul>';
+   517→      html += card("⚠️ 失败的分析", content, "#fef2f2");
+   518→    }
+   519→
+   520→    html += '<hr><p style="text-align:center;color:#64748b;font-size:11px">报告由 MolCraft AI 自动生成 · 基于 Molstar + Biopython + FreeSASA</p>';
+   521→    html += '</body></html>';
+   522→
+   523→    const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+   524→    const url = URL.createObjectURL(blob);
+   525→    const a = document.createElement("a");
+   526→    a.href = url;
+   527→    a.download = `overview-${label.replace(/[^\w\u4e00-\u9fa5-]+/g, "_")}.html`;
+   528→    a.click();
+   529→    URL.revokeObjectURL(url);
+   530→    toast("概览报告 (HTML) 已导出", "success");
+   531→  }, [state, activeId, activeStructure, toast]);
+   532→
+   533→  /** Capture a screenshot of the current Molstar viewport */
+   534→  const handleScreenshot = useCallback(async () => {
+   535→    if (!viewer) {
+   536→      toast("查看器未就绪", "error");
+   537→      return;
+   538→    }
+   539→    try {
+   540→      const plugin = viewer.plugin as any;
+   541→      const dataUri = await plugin?.helpers?.viewportScreenshot?.getImageDataUri({
+   542→        width: 1920,
+   543→        height: 1080,
+   544→        transparency: false,
+   545→        axes: true,
+   546→      });
+   547→      if (!dataUri) {
+   548→        toast("截图失败: 无图像数据", "error");
+   549→        return;
+   550→      }
+   551→      const label = activeStructure?.label ?? activeId ?? "structure";
+   552→      const a = document.createElement("a");
+   553→      a.href = dataUri;
+   554→      a.download = `overview-screenshot-${label.replace(/[^\w\u4e00-\u9fa5-]+/g, "_")}-${Date.now()}.png`;
+   555→      a.click();
+   556→      toast("视口截图已下载", "success");
+   557→    } catch (err) {
+   558→      const msg = err instanceof Error ? err.message : String(err);
+   559→      toast(`截图失败: ${msg}`, "error");
+   560→    }
+   561→  }, [viewer, activeStructure, activeId, toast]);
+   562→
+   563→  return (
+   564→    <div className="rounded-lg border bg-card shadow-sm overflow-hidden">
+   565→      {/* Header */}
+   566→      <div className="dashboard-header flex items-center justify-between border-b px-3 py-2">
+   567→        <div className="flex min-w-0 items-center gap-2">
+   568→          <LayoutDashboard className="h-4 w-4 shrink-0 text-primary" />
+   569→          <span className="text-sm font-semibold">结构概览仪表盘</span>
+   570→          {activeId && (
+   571→            <Badge variant="outline" className="truncate font-mono text-[9px]">
+   572→              {activeStructure?.label ?? activeId}
+   573→            </Badge>
+   574→          )}
+   575→        </div>
+   576→        <div className="flex items-center gap-1">
+   577→          <Popover>
+   578→            <PopoverTrigger asChild>
+   579→              <Button
+   580→                variant="ghost"
+   581→                size="icon"
+   582→                className="h-7 w-7"
+   583→                disabled={loading || !state.loaded}
+   584→                title="导出概览报告"
+   585→              >
+   586→                <Download className="h-3.5 w-3.5" />
+   587→              </Button>
+   588→            </PopoverTrigger>
+   589→            <PopoverContent align="end" className="w-48 p-1" sideOffset={4}>
+   590→              <button
+   591→                onClick={handleExport}
+   592→                className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition hover:bg-accent"
+   593→              >
+   594→                <Download className="h-3.5 w-3.5 text-emerald-600" />
+   595→                <div>
+   596→                  <div className="font-medium">Markdown (.md)</div>
+   597→                  <div className="text-[9px] text-muted-foreground">纯文本,适合 GitHub</div>
+   598→                </div>
+   599→              </button>
+   600→              <button
+   601→                onClick={handleExportHtml}
+   602→                className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs transition hover:bg-accent"
+   603→              >
+   604→                <Download className="h-3.5 w-3.5 text-blue-600" />
+   605→                <div>
+   606→                  <div className="font-medium">HTML (.html)</div>
+   607→                  <div className="text-[9px] text-muted-foreground">带样式,可直接打开</div>
+   608→                </div>
+   609→              </button>
+   610→            </PopoverContent>
+   611→          </Popover>
+   612→          <Button
+   613→            variant="ghost"
+   614→            size="icon"
+   615→            className="h-7 w-7"
+   616→            onClick={handleScreenshot}
+   617→            disabled={!viewer}
+   618→            title="截图当前视口 (PNG)"
+   619→          >
+   620→            <Camera className="h-3.5 w-3.5" />
+   621→          </Button>
+   622→          <Button
+   623→            variant="ghost"
+   624→            size="icon"
+   625→            className="h-7 w-7"
+   626→            onClick={fetchAll}
+   627→            disabled={loading}
+   628→            title="重新分析"
+   629→          >
+   630→            <RefreshCw className={`h-3.5 w-3.5 ${loading ? "animate-spin" : ""}`} />
+   631→          </Button>
+   632→        </div>
+   633→      </div>
+   634→
+   635→      <div className="space-y-3 p-3">
+   636→        {/* Loading progress */}
+   637→        {loading && (
+   638→          <div className="space-y-2">
+   639→            <div className="flex items-center justify-between text-[10px]">
+   640→              <span className="text-muted-foreground">正在并行运行 8 项分析…</span>
+   641→              <span className="font-mono text-primary">{progress}%</span>
+   642→            </div>
+   643→            <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+   644→              <div
+   645→                className="h-full rounded-full bg-primary transition-all duration-300"
+   646→                style={{ width: `${progress}%` }}
+   647→              />
+   648→            </div>
+   649→            <div className="grid grid-cols-4 gap-1">
+   650→              {["摘要", "Ramachandran", "二级结构", "B-factor", "SASA", "二硫键", "寡聚体", "验证"].map((label, i) => {
+   651→                const done = progressRef.current > i;
+   652→                return (
+   653→                  <div
+   654→                    key={i}
+   655→                    className={`flex items-center justify-center rounded border p-1 text-[9px] transition ${
+   656→                      done
+   657→                        ? "border-emerald-500/40 bg-emerald-500/5 text-emerald-600"
+   658→                        : "border-muted bg-muted/20 text-muted-foreground"
+   659→                    }`}
+   660→                  >
+   661→                    {done ? "✓" : "…"} {label}
+   662→                  </div>
+   663→                );
+   664→              })}
+   665→            </div>
+   666→          </div>
+   667→        )}
+   668→
+   669→        {/* Errors */}
+   670→        {state.errors.length > 0 && !loading && (
+   671→          <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-2 text-[10px] text-amber-700">
+   672→            <div className="font-medium">部分分析失败 ({state.errors.length}):</div>
+   673→            <div className="mt-0.5 space-y-0.5">
+   674→              {state.errors.slice(0, 3).map((err, i) => (
+   675→                <div key={i} className="font-mono text-[9px] truncate">
+   676→                  {err}
+   677→                </div>
+   678→              ))}
+   679→              {state.errors.length > 3 && (
+   680→                <div className="text-[9px]">+{state.errors.length - 3} 更多</div>
+   681→              )}
+   682→            </div>
+   683→          </div>
+   684→        )}
+   685→
+   686→        {/* Empty state */}
+   687→        {!loading && !state.loaded && !activeId && (
+   688→          <div className="py-6 text-center text-[11px] text-muted-foreground">
+   689→            <LayoutDashboard className="mx-auto mb-1 h-8 w-8 text-muted-foreground/40" />
+   690→            加载一个结构以生成综合概览
+   691→          </div>
+   692→        )}
+   693→
+   694→        {/* Loaded content */}
+   695→        {!loading && state.loaded && (
+   696→          <div className="space-y-3">
+   697→            {/* Row 1: Identity + Quality banner */}
+   698→            <div className="grid grid-cols-2 gap-2">
+   699→              {/* Identity card */}
+   700→              <div className="rounded-md border bg-primary/5 p-2">
+   701→                <div className="mb-1 flex items-center gap-1 text-[9px] font-medium uppercase text-muted-foreground">
+   702→                  <Microscope className="h-3 w-3 text-primary" />
+   703→                  结构标识
+   704→                </div>
+   705→                <div className="font-mono text-sm font-bold text-foreground">
+   706→                  {activeStructure?.label ?? activeId}
+   707→                </div>
+   708→                <div className="mt-0.5 text-[9px] text-muted-foreground">
+   709→                  {state.summary ? `${state.summary.chain_count} 链 · ${state.summary.total_residues} 残基 · ${state.summary.total_atoms} 原子` : "—"}
+   710→                </div>
+   711→              </div>
+   712→
+   713→              {/* Quality card */}
+   714→              {state.validation ? (
+   715→                <div
+   716→                  className="rounded-md border p-2"
+   717→                  style={{
+   718→                    borderColor: QUALITY_META[state.validation.quality].color + "60",
+   719→                    background: `linear-gradient(135deg, ${QUALITY_META[state.validation.quality].bg} 0%, transparent 70%)`,
+   720→                  }}
+   721→                >
+   722→                  <div className="mb-1 flex items-center justify-between text-[9px] font-medium uppercase text-muted-foreground">
+   723→                    <span>质量评分</span>
+   724→                    <span
+   725→                      className="rounded px-1.5 py-0 text-[9px] font-bold"
+   726→                      style={{
+   727→                        color: QUALITY_META[state.validation.quality].color,
+   728→                        backgroundColor: QUALITY_META[state.validation.quality].bg,
+   729→                      }}
+   730→                    >
+   731→                      {QUALITY_META[state.validation.quality].label}
+   732→                    </span>
+   733→                  </div>
+   734→                  <div className="grid grid-cols-3 gap-1 text-[9px]">
+   735→                    <div>
+   736→                      <span className="text-muted-foreground">碰撞: </span>
+   737→                      <span className={state.validation.clash_count > 3 ? "text-red-600 font-bold" : "text-foreground"}>
+   738→                        {state.validation.clash_count}
+   739→                      </span>
+   740→                    </div>
+   741→                    <div>
+   742→                      <span className="text-muted-foreground">拉氏: </span>
+   743→                      <span className={state.validation.rama_outlier_pct > 5 ? "text-red-600 font-bold" : state.validation.rama_outlier_pct > 2 ? "text-amber-600 font-bold" : "text-emerald-600 font-bold"}>
+   744→                        {state.validation.rama_outlier_pct}%
+   745→                      </span>
+   746→                    </div>
+   747→                    <div>
+   748→                      <span className="text-muted-foreground">缺侧链: </span>
+   749→                      <span className={state.validation.missing_sidechain_count > 1 ? "text-amber-600 font-bold" : "text-foreground"}>
+   750→                        {state.validation.missing_sidechain_count}
+   751→                      </span>
+   752→                    </div>
+   753→                  </div>
+   754→                </div>
+   755→              ) : (
+   756→                <div className="rounded-md border border-dashed p-2 text-center text-[10px] text-muted-foreground">
+   757→                  验证数据不可用
+   758→                </div>
+   759→              )}
+   760→            </div>
+   761→
+   762→            {/* Row 2: Geometry metrics */}
+   763→            <div className="grid grid-cols-4 gap-1.5">
+   764→              {/* Ramachandran */}
+   765→              <MetricCard
+   766→                icon={<Activity className="h-3 w-3" />}
+   767→                label="偏好区"
+   768→                value={state.rama ? `${state.rama.favoured_pct}%` : "—"}
+   769→                color={state.rama && state.rama.favoured_pct > 90 ? "#10b981" : state.rama && state.rama.favoured_pct > 80 ? "#f59e0b" : "#ef4444"}
+   770→              />
+   771→              {/* Secondary structure */}
+   772→              <MetricCard
+   773→                icon={<Box className="h-3 w-3" />}
+   774→                label="α/β 比"
+   775→                value={state.ss ? `${state.ss.alpha_helix_pct}/${state.ss.beta_sheet_pct}` : "—"}
+   776→                color="#3b82f6"
+   777→              />
+   778→              {/* B-factor mean */}
+   779→              <MetricCard
+   780→                icon={<Zap className="h-3 w-3" />}
+   781→                label="B 均值"
+   782→                value={state.bfactor ? (() => {
+   783→                  const first = Object.values(state.bfactor.chains)[0];
+   784→                  return first ? first.mean.toFixed(1) : "—";
+   785→                })() : "—"}
+   786→                color="#8b5cf6"
+   787→              />
+   788→              {/* Total SASA */}
+   789→              <MetricCard
+   790→                icon={<SunMedium className="h-3 w-3" />}
+   791→                label="总 SASA"
+   792→                value={state.sasa ? `${(state.sasa.total_sasa_A2 / 1000).toFixed(1)}k` : "—"}
+   793→                color="#06b6d4"
+   794→              />
+   795→            </div>
+   796→
+   797→            {/* Row 3: Secondary structure composition bar */}
+   798→            {state.ss && state.ss.total_residues > 0 && (
+   799→              <div>
+   800→                <div className="mb-1 flex items-center gap-1 text-[10px] font-medium">
+   801→                  <Box className="h-3 w-3 text-blue-500" />
+   802→                  二级结构组成
+   803→                </div>
+   804→                <div className="flex h-6 overflow-hidden rounded border">
+   805→                  {(["alpha_helix", "beta_sheet", "turn", "coil"] as const).map((key) => {
+   806→                    const pct = state.ss!.ss_counts[key];
+   807→                    const totalPct = state.ss![`${key}_pct` as keyof SsData] as number;
+   808→                    if (totalPct === 0) return null;
+   809→                    return (
+   810→                      <div
+   811→                        key={key}
+   812→                        className="flex items-center justify-center text-[8px] font-bold text-white"
+   813→                        style={{
+   814→                          width: `${totalPct}%`,
+   815→                          backgroundColor: SS_COLORS[key],
+   816→                        }}
+   817→                        title={`${SS_LABELS[key]}: ${pct} 残基 (${totalPct}%)`}
+   818→                      >
+   819→                        {totalPct >= 10 ? `${totalPct}%` : ""}
+   820→                      </div>
+   821→                    );
+   822→                  })}
+   823→                </div>
+   824→                <div className="mt-0.5 flex flex-wrap gap-x-2 text-[9px]">
+   825→                  {(["alpha_helix", "beta_sheet", "turn", "coil"] as const).map((key) => (
+   826→                    <div key={key} className="flex items-center gap-1">
+   827→                      <span className="h-1.5 w-1.5 rounded-sm" style={{ backgroundColor: SS_COLORS[key] }} />
+   828→                      <span className="text-muted-foreground">{SS_LABELS[key]}</span>
+   829→                      <span className="font-mono">{state.ss!.ss_counts[key]}</span>
+   830→                    </div>
+   831→                  ))}
+   832→                </div>
+   833→              </div>
+   834→            )}
+   835→
+   836→            {/* Row 4: Oligomer + Disulfide + Ligands */}
+   837→            <div className="grid grid-cols-3 gap-1.5">
+   838→              {/* Oligomer */}
+   839→              {state.oligomer && (
+   840→                <div className="rounded-md border bg-blue-500/5 p-2">
+   841→                  <div className="mb-0.5 flex items-center gap-1 text-[9px] font-medium uppercase text-muted-foreground">
+   842→                    <Layers className="h-3 w-3 text-blue-500" />
+   843→                    寡聚状态
+   844→                  </div>
+   845→                  <div className="font-mono text-xs font-bold text-blue-600">
+   846→                    {state.oligomer.oligomer_type}
+   847→                  </div>
+   848→                  <div className="text-[9px] text-muted-foreground">
+   849→                    {state.oligomer.n_chains} 链 · {state.oligomer.n_interfaces} 界面
+   850→                  </div>
+   851→                </div>
+   852→              )}
+   853→
+   854→              {/* Disulfide bonds */}
+   855→              {state.disulfide && (
+   856→                <div className="rounded-md border bg-amber-500/5 p-2">
+   857→                  <div className="mb-0.5 flex items-center gap-1 text-[9px] font-medium uppercase text-muted-foreground">
+   858→                    <Link2 className="h-3 w-3 text-amber-500" />
+   859→                    二硫键
+   860→                  </div>
+   861→                  <div className="font-mono text-xs font-bold text-amber-600">
+   862→                    {state.disulfide.count} 个
+   863→                  </div>
+   864→                  <div className="text-[9px] text-muted-foreground">
+   865→                    CYS-CYS &lt; {state.disulfide.cutoff}Å
+   866→                  </div>
+   867→                </div>
+   868→              )}
+   869→
+   870→              {/* Ligands */}
+   871→              {state.summary && Object.keys(state.summary.ligands).length > 0 && (
+   872→                <div className="rounded-md border bg-violet-500/5 p-2">
+   873→                  <div className="mb-0.5 flex items-center gap-1 text-[9px] font-medium uppercase text-muted-foreground">
+   874→                    <FlaskConical className="h-3 w-3 text-violet-500" />
+   875→                    配体
+   876→                  </div>
+   877→                  <div className="flex flex-wrap gap-0.5">
+   878→                    {Object.entries(state.summary.ligands).slice(0, 4).map(([lig, count]) => (
+   879→                      <span
+   880→                        key={lig}
+   881→                        className="rounded bg-violet-500/15 px-1 font-mono text-[9px] text-violet-700"
+   882→                      >
+   883→                        {lig}
+   884→                        {count > 1 ? `×${count}` : ""}
+   885→                      </span>
+   886→                    ))}
+   887→                    {Object.keys(state.summary.ligands).length > 4 && (
+   888→                      <span className="text-[9px] text-muted-foreground">
+   889→                        +{Object.keys(state.summary.ligands).length - 4}
+   890→                      </span>
+   891→                    )}
+   892→                  </div>
+   893→                </div>
+   894→              )}
+   895→            </div>
+   896→
+   897→            {/* Row 5: Chain summary table */}
+   898→            {state.summary && Object.keys(state.summary.chains).length > 0 && (
+   899→              <div>
+   900→                <div className="mb-1 flex items-center gap-1 text-[10px] font-medium">
+   901→                  <Layers className="h-3 w-3 text-muted-foreground" />
+   902→                  链详情
+   903→                </div>
+   904→                <div className="overflow-x-auto scrollbar-thin">
+   905→                  <table className="w-full border-collapse text-[10px]">
+   906→                    <thead>
+   907→                      <tr>
+   908→                        <th className="border-b bg-muted/30 px-1.5 py-0.5 text-left font-medium text-muted-foreground">链</th>
+   909→                        <th className="border-b bg-muted/30 px-1.5 py-0.5 text-right font-medium text-muted-foreground">残基</th>
+   910→                        <th className="border-b bg-muted/30 px-1.5 py-0.5 text-right font-medium text-muted-foreground">原子</th>
+   911→                        <th className="border-b bg-muted/30 px-1.5 py-0.5 text-right font-medium text-muted-foreground">范围</th>
+   912→                      </tr>
+   913→                    </thead>
+   914→                    <tbody>
+   915→                      {Object.entries(state.summary.chains).map(([chain, info]) => (
+   916→                        <tr key={chain}>
+   917→                          <td className="px-1.5 py-0.5 font-mono font-bold text-foreground">{chain}</td>
+   918→                          <td className="px-1.5 py-0.5 text-right font-mono">{info.residue_count}</td>
+   919→                          <td className="px-1.5 py-0.5 text-right font-mono">{info.atom_count}</td>
+   920→                          <td className="px-1.5 py-0.5 text-right font-mono text-[9px] text-muted-foreground">
+   921→                            {info.first_resno}-{info.last_resno}
+   922→                          </td>
+   923→                        </tr>
+   924→                      ))}
+   925→                    </tbody>
+   926→                  </table>
+   927→                </div>
+   928→              </div>
+   929→            )}
+   930→
+   931→            <div className="flex items-start gap-1.5 rounded-md bg-primary/5 p-2 text-[10px] text-muted-foreground">
+   932→              <Info className="mt-0.5 h-3 w-3 shrink-0 text-primary" />
+   933→              <div>
+   934→                综合概览: 并行运行 8 项分析 (摘要 / Ramachandran / 二级结构 / B-factor / SASA / 二硫键 / 寡聚体 / 验证),一屏掌握结构全局特征。
+   935→              </div>
+   936→            </div>
+   937→          </div>
+   938→        )}
+   939→      </div>
+   940→    </div>
+   941→  );
+   942→}
+   943→
+   944→/** Compact metric card */
+   945→function MetricCard({
+   946→  icon,
+   947→  label,
+   948→  value,
+   949→  color,
+   950→}: {
+   951→  icon: React.ReactNode;
+   952→  label: string;
+   953→  value: string;
+   954→  color: string;
+   955→}) {
+   956→  return (
+   957→    <div className="rounded-md border bg-card p-1.5 text-center">
+   958→      <div className="mb-0.5 flex items-center justify-center gap-0.5 text-[9px] uppercase text-muted-foreground">
+   959→        <span style={{ color }}>{icon}</span>
+   960→        {label}
+   961→      </div>
+   962→      <div className="font-mono text-xs font-bold" style={{ color }}>
+   963→        {value}
+   964→      </div>
+   965→    </div>
+   966→  );
+   967→}
+   968→
