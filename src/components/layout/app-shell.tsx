@@ -209,6 +209,11 @@ function MeasureToolbar() {
   // clickFocus/clickCenterFocus props + removes the semi-transparent
   // ball-and-stick representation added for measure mode).
   const restoreFocusRef = useRef<(() => void) | null>(null);
+  // Entry guard: entering measure mode (and disableFocusBehaviors) fires a
+  // synthetic click event through behaviors.interaction.click. We ignore
+  // click events for a short window after entering measure mode so the
+  // toolbar starts at "0/2" instead of "1/2".
+  const entryGuardUntilRef = useRef(0);
 
   // When measure mode changes, set Molstar interactivity granularity + disable
   // focus behavior + add a semi-transparent ball-and-stick representation so
@@ -221,9 +226,17 @@ function MeasureToolbar() {
     if (measureMode !== "off") {
       // Set granularity to element so clicks resolve to individual atoms.
       plugin.managers.interactivity.setProps({ granularity: "element" });
-      // Clear any previous selection.
-      try { plugin.managers.structure.selection.clear(); } catch {}
-      try { plugin.managers.interactivity.lociSelects.deselectAll(); } catch {}
+      // Clear any previous HIGHLIGHTS only. Do NOT call lociSelects.deselectAll()
+      // here — it fires a synthetic click event through the behaviors.interaction.click
+      // observable, which our click subscriber picks up and adds to pendingRef,
+      // causing the toolbar to show "1/2" immediately after entering measure
+      // mode instead of the expected "0/2". Clearing highlights is enough.
+      try { plugin.managers.interactivity.lociHighlights.clearHighlights(); } catch {}
+      // Arm the entry guard: ignore click events for 500ms after entering
+      // measure mode. disableFocusBehaviors + the granularity change can
+      // each fire a synthetic click event with the currently-highlighted
+      // loci, which would instantly bump pending to 1.
+      entryGuardUntilRef.current = Date.now() + 500;
       // Clear pending. Resetting pendingCount here is necessary because
       // entering measure mode invalidates any half-collected measurement;
       // gated by length>0 to avoid a redundant render when already empty.
@@ -278,6 +291,10 @@ function MeasureToolbar() {
 
     const sub = clickObs.subscribe((evt: any) => {
       try {
+        // Entry guard: ignore synthetic click events fired within 500ms of
+        // entering measure mode (disableFocusBehaviors + granularity change
+        // each fire one with the currently-highlighted loci).
+        if (Date.now() < entryGuardUntilRef.current) return;
         // The loci is at evt.current.loci (behaviors.interaction.click format).
         const loci = evt?.current?.loci ?? evt?.state?.loci ?? evt?.current;
         if (!loci) return;
@@ -407,8 +424,9 @@ function MeasureToolbar() {
     setPendingCount(0);
     if (viewer) {
       const plugin = viewer.plugin as any;
+      // Only clear highlights — deselectAll() fires a synthetic click event
+      // that the subscriber picks up, instantly bumping pending to 1.
       try {
-        plugin?.managers?.interactivity?.lociSelects?.deselectAll();
         plugin?.managers?.interactivity?.lociHighlights?.clearHighlights();
       } catch {}
     }

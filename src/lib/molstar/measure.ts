@@ -206,7 +206,11 @@ export function extractAtomInfoFromLoci(
   }
 
   // Walk the loci's elements for hierarchy info (residue/chain/atom names).
-  // This is best-effort — if it fails we still have coords above.
+  // We use the bundle's StructureElement.Loci.getFirstLocation(loci) helper
+  // which returns a fully-resolved StructureElement.Location (with structure,
+  // unit, AND element all correctly set) — far more reliable than walking the
+  // minified loci shape ourselves. From that Location, StructureProperties
+  // accessors give us atom/residue/chain names + coords.
   let resname: string | undefined;
   let resno: number | undefined;
   let chain: string | undefined;
@@ -214,74 +218,27 @@ export function extractAtomInfoFromLoci(
   let element: string | undefined;
 
   try {
-    const l = loci as {
-      elements?: Array<{ unit?: any; indices?: unknown }>;
-    };
-    const elements = l?.elements;
-    if (Array.isArray(elements) && elements.length > 0) {
-      const firstEl = elements[0];
-      const unit = firstEl?.unit;
-      if (unit) {
-        const localIdx = orderedSetGetAt(firstEl.indices, 0);
-        if (localIdx != null) {
-          // Resolve global atom index via unit.elements (local→global map).
-          let atomIdx: number | null = null;
-          try {
-            const g = orderedSetGetAt(unit.elements, localIdx);
-            if (typeof g === "number") atomIdx = g;
-          } catch {
-            /* ignore */
-          }
-          if (atomIdx == null) atomIdx = localIdx;
-
-          // Use the bundle's StructureProperties accessors if available —
-          // they accept a StructureElement.Location and return the property.
-          const bundle = (window as any).molstar;
-          const SP = bundle?.lib?.structure?.StructureProperties;
-          const SE = bundle?.lib?.structure?.StructureElement;
-          if (SP && SE?.Location?.create && unit.model) {
-            // Location.create(unit, elementIndex)
-            const loc = SE.Location.create(unit, atomIdx);
-            if (loc) {
-              try { atomName = SP.atom.label_atom_id(loc); } catch {}
-              try { element = SP.atom.type_symbol(loc); } catch {}
-              try { resname = SP.residue.auth_comp_id(loc) || SP.residue.label_comp_id(loc); } catch {}
-              try {
-                const authResno = SP.residue.auth_seq_id(loc);
-                if (typeof authResno === "number") resno = authResno;
-                else resno = SP.residue.label_seq_id(loc);
-              } catch {}
-              try { chain = SP.chain.auth_asym_id(loc) || SP.chain.label_asym_id(loc); } catch {}
-            }
-          }
-
-          // Fallback to direct model walk (legacy path).
-          if (atomName == null && chain == null) {
-            const model = unit.model;
-            const hierarchy = model?.atomicHierarchy;
-            const conf = model?.atomicConformation;
-            if (hierarchy && conf) {
-              if (x == null) x = columnValue<number>(conf.x, atomIdx);
-              if (y == null) y = columnValue<number>(conf.y, atomIdx);
-              if (z == null) z = columnValue<number>(conf.z, atomIdx);
-              atomName = columnValue<string>(hierarchy?.atoms?.label_atom_id, atomIdx);
-              element = columnValue<string>(hierarchy?.atoms?.type_symbol, atomIdx);
-              const resIdx = columnValue<number>(hierarchy?.residueAtomSegments?.index, atomIdx);
-              if (typeof resIdx === "number") {
-                resname = columnValue<string>(hierarchy?.residues?.label_comp_id, resIdx)
-                  || columnValue<string>(hierarchy?.residues?.auth_comp_id, resIdx);
-                const authResno = columnValue<number>(hierarchy?.residues?.auth_seq_id, resIdx);
-                const labelResno = columnValue<number>(hierarchy?.residues?.label_seq_id, resIdx);
-                resno = typeof authResno === "number" ? authResno : labelResno;
-                const chainIdx = columnValue<number>(hierarchy?.chainAtomSegments?.index, atomIdx);
-                if (typeof chainIdx === "number") {
-                  chain = columnValue<string>(hierarchy?.chains?.auth_asym_id, chainIdx)
-                    || columnValue<string>(hierarchy?.chains?.label_asym_id, chainIdx);
-                }
-              }
-            }
-          }
-        }
+    const bundle = (window as any).molstar;
+    const SP = bundle?.lib?.structure?.StructureProperties;
+    const SE = bundle?.lib?.structure?.StructureElement;
+    if (SP && SE?.Loci?.getFirstLocation) {
+      const loc = SE.Loci.getFirstLocation(loci);
+      if (loc) {
+        try { atomName = SP.atom.label_atom_id(loc); } catch {}
+        try { element = SP.atom.type_symbol(loc); } catch {}
+        try { resname = SP.residue.auth_comp_id(loc) || SP.residue.label_comp_id(loc); } catch {}
+        try {
+          const authResno = SP.residue.auth_seq_id(loc);
+          if (typeof authResno === "number") resno = authResno;
+          else resno = SP.residue.label_seq_id(loc);
+        } catch {}
+        try { chain = SP.chain.auth_asym_id(loc) || SP.chain.label_asym_id(loc); } catch {}
+        // Also fill coords from SP if Loci.getCenter didn't already.
+        try {
+          if (x == null) x = SP.atom.x(loc);
+          if (y == null) y = SP.atom.y(loc);
+          if (z == null) z = SP.atom.z(loc);
+        } catch {}
       }
     }
   } catch {

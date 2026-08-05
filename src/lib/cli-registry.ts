@@ -845,7 +845,7 @@ model = next(iter(struct))
 if chain1 not in model or chain2 not in model:
     print(json.dumps({"error": f"chain {chain1} or {chain2} not found", "available_chains": [c.id for c in model]}))
     raise SystemExit
-POS = {'ARG': ['NH1', 'NH2', 'NE'], 'LYS': ['NZ'], 'HIS': ['ND1', 'NE2']}
+POS = {'ARG': ['NH1', 'NH2'], 'LYS': ['NZ'], 'HIS': ['ND1', 'NE2']}
 NEG = {'ASP': ['OD1', 'OD2'], 'GLU': ['OE1', 'OE2']}
 pos_atoms1 = [a for r in model[chain1] if r.resname in POS for a in r if a.get_name() in POS[r.resname]]
 neg_atoms1 = [a for r in model[chain1] if r.resname in NEG for a in r if a.get_name() in NEG[r.resname]]
@@ -972,8 +972,18 @@ if chain1_id not in model or chain2_id not in model:
     print(json.dumps({"error": f"chain {chain1_id} or {chain2_id} not found", "available_chains": [c.id for c in model]}))
     raise SystemExit
 
-# ---- 1. Salt Bridges (ARG/LYS/HIS ↔ ASP/GLU, < 4.0Å) ----
-POS = {'ARG': ['NH1', 'NH2', 'NE'], 'LYS': ['NZ'], 'HIS': ['ND1', 'NE2']}
+# ---- 1. Salt Bridges (ARG/LYS/HIS+ ↔ ASP/GLU-, < 4.0Å) ----
+# Salt bridge = ionic interaction between side-chain charged groups.
+# Only the TERMINAL charged atoms count (not every N/O on the residue):
+#   ARG guanidinium → NH1, NH2 (the two terminal nitrogens that actually
+#     contact the negative partner; NE is the backbone-linking nitrogen
+#     and is NOT counted as a salt-bridge contact atom).
+#   LYS ammonium    → NZ (terminal)
+#   HIS imidazole   → ND1, NE2 (both ring nitrogens can be protonated)
+#   ASP carboxylate → OD1, OD2 (both terminal oxygens)
+#   GLU carboxylate → OE1, OE2 (both terminal oxygens)
+# Backbone N / O are never salt-bridge atoms.
+POS = {'ARG': ['NH1', 'NH2'], 'LYS': ['NZ'], 'HIS': ['ND1', 'NE2']}
 NEG = {'ASP': ['OD1', 'OD2'], 'GLU': ['OE1', 'OE2']}
 SALT_CUTOFF = 4.0
 pos1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in POS for a in r if a.get_name() in POS[r.resname]]
