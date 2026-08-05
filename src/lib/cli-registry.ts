@@ -1008,6 +1008,12 @@ for a_tuple in neg1:
             })
 
 # ---- 2. Hydrogen Bonds (N/O donor-acceptor, < 3.5Å) ----
+# NOTE: a salt bridge (ARG/LYS/HIS+ ↔ ASP/GLU-) is also geometrically a
+# hydrogen bond (the charged donor N-H is also an H-bond donor, and the
+# charged acceptor O is also an H-bond acceptor). To avoid double-counting,
+# we record every atom pair already classified as a salt bridge and skip
+# those pairs here. This way a single ARG↔ASP contact shows as ONE entry
+# (salt_bridge), not two (salt_bridge + hbond).
 HBOND_CUTOFF = 3.5
 DONOR_RES = {
     'SER': ['OG'], 'THR': ['OG1'], 'TYR': ['OH'], 'CYS': ['SG'],
@@ -1022,6 +1028,17 @@ ACCEPTOR_RES = {
     'SER': ['OG'], 'THR': ['OG1'], 'TYR': ['OH'],
     'HIS': ['ND1', 'NE2'], 'MET': ['SD'],
 }
+
+# Build a set of atom-pair keys already classified as salt bridges.
+# Key = frozenset of {(chain, resno, atomname)} so direction doesn't matter.
+salt_pair_keys = set()
+for sb in salt_bridges:
+    k = frozenset([
+        (sb["chain1"], sb["resno1"], sb["atom1"]),
+        (sb["chain2"], sb["resno2"], sb["atom2"]),
+    ])
+    salt_pair_keys.add(k)
+
 donors1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in DONOR_RES for a in r if a.get_name() in DONOR_RES.get(r.resname, [])]
 acceptors1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in ACCEPTOR_RES for a in r if a.get_name() in ACCEPTOR_RES.get(r.resname, [])]
 donors2 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain2_id] if r.resname in DONOR_RES for a in r if a.get_name() in DONOR_RES.get(r.resname, [])]
@@ -1034,6 +1051,9 @@ for d_tuple in donors1:
         a, ra, ca = a_tuple
         d_dist = float(d - a)
         if d_dist <= HBOND_CUTOFF:
+            k = frozenset([(cd.id, int(rd.id[1]), d.get_name()), (ca.id, int(ra.id[1]), a.get_name())])
+            if k in salt_pair_keys:
+                continue
             hbonds.append({
                 "type": "hbond",
                 "chain1": cd.id, "resno1": int(rd.id[1]), "resname1": rd.resname, "atom1": d.get_name(),
@@ -1046,6 +1066,9 @@ for d_tuple in donors2:
         a, ra, ca = a_tuple
         d_dist = float(d - a)
         if d_dist <= HBOND_CUTOFF:
+            k = frozenset([(cd.id, int(rd.id[1]), d.get_name()), (ca.id, int(ra.id[1]), a.get_name())])
+            if k in salt_pair_keys:
+                continue
             hbonds.append({
                 "type": "hbond",
                 "chain1": cd.id, "resno1": int(rd.id[1]), "resname1": rd.resname, "atom1": d.get_name(),

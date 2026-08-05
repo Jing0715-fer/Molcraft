@@ -14,7 +14,7 @@ import { ReportsPanel } from "./reports-panel";
 import { HistoryPanel } from "./history-panel";
 import { MolstarViewer } from "@/components/molstar/molstar-viewer";
 import { MeasureOverlay } from "@/components/molstar/measure-overlay";
-import { disableFocusBehaviors, clearAllMeasurementsAndFocus } from "@/lib/molstar/measure";
+import { disableFocusBehaviors, clearAllMeasurementsAndFocus, extractAtomInfoFromLoci } from "@/lib/molstar/measure";
 import { useAppStore, selectActiveStructure, registerToast } from "@/lib/store";
 import { toast as sonnerToast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -198,6 +198,8 @@ function MeasureToolbar() {
   const addMeasurement = useAppStore((s) => s.addMeasurement);
   const removeMeasurement = useAppStore((s) => s.removeMeasurement);
   const clearMeasurements = useAppStore((s) => s.clearMeasurements);
+  const addInteractionLine = useAppStore((s) => s.addInteractionLine);
+  const clearInteractionLines = useAppStore((s) => s.clearInteractionLines);
   const structures = useAppStore((s) => s.structures);
   const toast = useAppStore((s) => s.toast);
   const { t } = useLang();
@@ -299,21 +301,72 @@ function MeasureToolbar() {
           return;
         }
 
-        // Complete the measurement using Molstar's measurement manager.
-        const mm = plugin.managers.structure.measurement;
+        // Complete the measurement. Extract atom info from each loci so we
+        // can show residue/atom/distance in the list AND draw our own overlay
+        // line (which can be removed individually — Molstar's native
+        // addDistance can't be removed one-at-a-time).
+        const atomInfos = newPending.map((l) => extractAtomInfoFromLoci(plugin, l));
+
         if (measureMode === "distance" && newPending.length === 2) {
-          mm.addDistance(newPending[0], newPending[1]);
+          const [a0, a1] = atomInfos;
+          // We do NOT call mm.addDistance here — Molstar's native measurement
+          // manager has no per-item remove API, so lines would accumulate.
+          // Instead we draw via our own overlay (interactionLines), which can
+          // be removed individually via the list's X button.
+          const dist =
+            a0 && a1
+              ? Math.sqrt((a0.x - a1.x) ** 2 + (a0.y - a1.y) ** 2 + (a0.z - a1.z) ** 2)
+              : null;
+          const lineId = `ml-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          if (a0 && a1) {
+            addInteractionLine({
+              id: lineId,
+              from: { x: a0.x, y: a0.y, z: a0.z, label: a0.label },
+              to: { x: a1.x, y: a1.y, z: a1.z, label: a1.label },
+              color: "#f59e0b",
+              label: dist != null ? `${dist.toFixed(2)} Å` : "",
+              dashed: false,
+            });
+          }
+          const label =
+            a0 && a1
+              ? `${a0.resname ?? ""}${a0.resno ?? ""}${a0.chain ? `.${a0.chain}` : ""}/${a0.atomName ?? "?"} ↔ ${a1.resname ?? ""}${a1.resno ?? ""}${a1.chain ? `.${a1.chain}` : ""}/${a1.atomName ?? "?"}`
+              : t("distance_measured");
+          const detail = dist != null ? `${dist.toFixed(2)} Å` : t("shown_in_3d");
           addMeasurement({
             mode: "distance",
-            label: t("distance_measured"),
-            detail: t("shown_in_3d"),
+            label,
+            detail,
+            lineId: a0 && a1 ? lineId : undefined,
           });
           toast(t("distance_added"), "success");
         } else if (measureMode === "angle" && newPending.length === 3) {
-          mm.addAngle(newPending[0], newPending[1], newPending[2]);
+          const [a0, a1, a2] = atomInfos;
+          const label =
+            a0 && a1 && a2
+              ? `${a0.resname ?? ""}${a0.resno ?? ""}/${a0.atomName ?? "?"} · ${a1.resname ?? ""}${a1.resno ?? ""}/${a1.atomName ?? "?"} · ${a2.resname ?? ""}${a2.resno ?? ""}/${a2.atomName ?? "?"}`
+              : t("angle_measured");
+          // For angles, also draw overlay lines connecting the 3 atoms.
+          const angleLineBase = `ml-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+          if (a0 && a1 && a2) {
+            addInteractionLine({
+              id: `${angleLineBase}-1`,
+              from: { x: a0.x, y: a0.y, z: a0.z, label: a0.label },
+              to: { x: a1.x, y: a1.y, z: a1.z, label: a1.label },
+              color: "#8b5cf6",
+              dashed: false,
+            });
+            addInteractionLine({
+              id: `${angleLineBase}-2`,
+              from: { x: a1.x, y: a1.y, z: a1.z, label: a1.label },
+              to: { x: a2.x, y: a2.y, z: a2.z, label: a2.label },
+              color: "#8b5cf6",
+              dashed: false,
+            });
+          }
           addMeasurement({
             mode: "angle",
-            label: t("angle_measured"),
+            label,
             detail: t("shown_in_3d"),
           });
           toast(t("angle_added"), "success");
@@ -429,6 +482,7 @@ function MeasureToolbar() {
                 type="button"
                 onClick={() => {
                   clearMeasurements();
+                  clearInteractionLines();
                   if (viewer) {
                     try { viewer.plugin.managers.structure.measurement.clear(); } catch {}
                   }
