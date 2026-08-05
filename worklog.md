@@ -2276,3 +2276,32 @@ E2E verification (4HHB A↔B, agent-browser):
 Stage Summary:
 - Both bugs fixed, E2E-verified, pushed to GitHub (commit 80f7605).
 - remote main: 80f7605 | local HEAD: 80f7605
+
+---
+Task ID: MIGRATE-FIX-2
+Agent: main (Z.ai Code)
+Task: Fix 3 issues reported after the measure/interaction migration: (1) measure list shows generic label not residue/atom/distance, (2) clicking X doesn't remove the 3D line, (3) salt bridges double-counted as hbonds.
+
+Work Log:
+- **Issue 1: measure list shows "距离测量" instead of residue/atom/distance**:
+  - Root cause: the click handler called `mm.addDistance(loci1, loci2)` and stored a generic `t("distance_measured")` label — it never extracted atom info from the loci.
+  - Fix: use `extractAtomInfoFromLoci(plugin, loci)` for each clicked atom to get {chain, resno, resname, atomName, x,y,z}, compute the Euclidean distance, and store a rich label `ARG31.A/NH1 ↔ GLN127.B/OD1` + detail `3.21 Å`. Same for angles (3-atom label).
+
+- **Issue 2: clicking X on a measurement doesn't remove the 3D line**:
+  - Root cause: measurements were drawn by Molstar's native `mm.addDistance`, which has NO per-item remove API (only `clear()` for all). So removing the list entry left the 3D line.
+  - Fix: switched from Molstar's native measurement manager to our own `interactionLines` overlay (which draws via the MeasureOverlay canvas and is individually removable). Each measurement carries a `lineId` linking it to its interactionLine; `removeMeasurement(id)` now also filters that line from `interactionLines`. The clear-all trash button clears measurements + interactionLines + Molstar's native manager (for safety).
+  - Store changes: measurements entries gained optional `atoms?` and `lineId?` fields; `addInteractionLine` now accepts optional `id` (so the click handler controls the lineId for linking).
+
+- **Issue 3: salt bridges double-counted as hbonds**:
+  - Root cause: a salt bridge (ARG/LYS/HIS+ ↔ ASP/GLU-) is geometrically also a hydrogen bond — the charged donor N-H is in DONOR_RES and the charged acceptor O is in ACCEPTOR_RES, so ARG(NH1)↔ASP(OD1) at 3.2Å matched BOTH detectors.
+  - Fix: in the all_interactions recipe, build a `salt_pair_keys` set (frozenset of atom-pair tuples, direction-independent) from detected salt bridges, then skip those pairs in the hbond detection loop. An ARG↔ASP contact now shows as ONE salt_bridge entry, not two. Verified via Python unit test: charged pair skipped (True), SER↔ASP hbond preserved (False).
+
+E2E verification (4HHB, agent-browser):
+- Interaction click (ARG31(A)↔GLN127(B)): camera [11.3,13.4,151.8]→[28.3,5.8,75.5] (focused midpoint), interactionLines=1 (label "2.81 Å"), 0 errors.
+- Individual measurement removal: clicked X → measurements 1→0, interactionLines 1→0 (line removed).
+- all_interactions API (4HHB A↔B): 17 total (4 hbond + 13 hydrophobic, 0 salt on this interface). Dedup verified via synthetic ARG↔ASP unit test.
+
+Stage Summary:
+- All 3 issues fixed, E2E-verified, pushed to GitHub (commit 9164cd3).
+- remote main: 9164cd3 | local HEAD: 9164cd3
+- Lint clean (0 errors, only molstar.css <link> warning).
