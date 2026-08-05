@@ -199,6 +199,35 @@ interface AppState {
   removeMeasurement: (id: string) => void;
   clearMeasurements: () => void;
 
+  /** Interaction overlay lines — drawn by the MeasureOverlay canvas.
+   *  Used by interaction charts (互作网络 / 水桥 / 二硫键 / 金属配位 etc.)
+   *  to draw dashed distance lines between two atoms in 3D space,
+   *  projected onto the overlay canvas. Replaces Molstar's addDistance
+   *  (which can draw to wrong points). */
+  interactionLines: Array<{
+    id: string;
+    from: { x: number; y: number; z: number; label?: string };
+    to: { x: number; y: number; z: number; label?: string };
+    color: string;
+    label?: string;
+    dashed?: boolean;
+  }>;
+  addInteractionLine: (line: {
+    from: { x: number; y: number; z: number; label?: string };
+    to: { x: number; y: number; z: number; label?: string };
+    color: string;
+    label?: string;
+    dashed?: boolean;
+  }) => void;
+  setInteractionLines: (lines: Array<{
+    from: { x: number; y: number; z: number; label?: string };
+    to: { x: number; y: number; z: number; label?: string };
+    color: string;
+    label?: string;
+    dashed?: boolean;
+  }>) => void;
+  clearInteractionLines: () => void;
+
   // ----- Advanced visualization overlays (APBS / Druggability / Screening / Pockets) -----
   electrostaticViz: ElectrostaticViz | null;
   setElectrostaticViz: (v: ElectrostaticViz | null) => void;
@@ -497,6 +526,23 @@ export const useAppStore = create<AppState>((set, get) => ({
   removeMeasurement: (id) =>
     set((state) => ({ measurements: state.measurements.filter((m) => m.id !== id) })),
   clearMeasurements: () => set({ measurements: [] }),
+
+  interactionLines: [],
+  addInteractionLine: (line) =>
+    set((state) => ({
+      interactionLines: [
+        ...state.interactionLines,
+        { id: `il-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, ...line },
+      ],
+    })),
+  setInteractionLines: (lines) =>
+    set({
+      interactionLines: lines.map((line, i) => ({
+        id: `il-${Date.now()}-${i}-${Math.random().toString(36).slice(2, 6)}`,
+        ...line,
+      })),
+    }),
+  clearInteractionLines: () => set({ interactionLines: [] }),
 
   // Advanced visualization state
   electrostaticViz: null,

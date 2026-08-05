@@ -950,6 +950,149 @@ print(json.dumps({
     },
   },
   {
+    id: "all_interactions",
+    label: "全部互作 (All Interactions)",
+    description:
+      "一次性检测两条链之间的全部互作：盐桥、氢键、疏水接触，返回带类型标签的列表",
+    requires: ["biopython"],
+    params: [
+      { name: "chain1", type: "string", required: true, description: "链 1 ID" },
+      { name: "chain2", type: "string", required: true, description: "链 2 ID" },
+    ],
+    buildScript: (inputPath, params) => {
+      const chain1 = String(params.chain1 ?? "A");
+      const chain2 = String(params.chain2 ?? "B");
+      return `${RECIPE_HEADER}
+import math
+from Bio.PDB import NeighborSearch
+struct = load_structure("${inputPath}")
+chain1_id = "${chain1}"; chain2_id = "${chain2}"
+model = next(iter(struct))
+if chain1_id not in model or chain2_id not in model:
+    print(json.dumps({"error": f"chain {chain1_id} or {chain2_id} not found", "available_chains": [c.id for c in model]}))
+    raise SystemExit
+
+# ---- 1. Salt Bridges (ARG/LYS/HIS ↔ ASP/GLU, < 4.0Å) ----
+POS = {'ARG': ['NH1', 'NH2', 'NE'], 'LYS': ['NZ'], 'HIS': ['ND1', 'NE2']}
+NEG = {'ASP': ['OD1', 'OD2'], 'GLU': ['OE1', 'OE2']}
+SALT_CUTOFF = 4.0
+pos1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in POS for a in r if a.get_name() in POS[r.resname]]
+neg1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in NEG for a in r if a.get_name() in NEG[r.resname]]
+pos2 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain2_id] if r.resname in POS for a in r if a.get_name() in POS[r.resname]]
+neg2 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain2_id] if r.resname in NEG for a in r if a.get_name() in NEG[r.resname]]
+
+salt_bridges = []
+for a_tuple in pos1:
+    a, ra, ca = a_tuple
+    for b_tuple in neg2:
+        b, rb, cb = b_tuple
+        d = float(a - b)
+        if d <= SALT_CUTOFF:
+            salt_bridges.append({
+                "type": "salt_bridge",
+                "chain1": ca.id, "resno1": int(ra.id[1]), "resname1": ra.resname, "atom1": a.get_name(),
+                "chain2": cb.id, "resno2": int(rb.id[1]), "resname2": rb.resname, "atom2": b.get_name(),
+                "distance_A": round(d, 2),
+            })
+for a_tuple in neg1:
+    a, ra, ca = a_tuple
+    for b_tuple in pos2:
+        b, rb, cb = b_tuple
+        d = float(a - b)
+        if d <= SALT_CUTOFF:
+            salt_bridges.append({
+                "type": "salt_bridge",
+                "chain1": ca.id, "resno1": int(ra.id[1]), "resname1": ra.resname, "atom1": a.get_name(),
+                "chain2": cb.id, "resno2": int(rb.id[1]), "resname2": rb.resname, "atom2": b.get_name(),
+                "distance_A": round(d, 2),
+            })
+
+# ---- 2. Hydrogen Bonds (N/O donor-acceptor, < 3.5Å) ----
+HBOND_CUTOFF = 3.5
+DONOR_RES = {
+    'SER': ['OG'], 'THR': ['OG1'], 'TYR': ['OH'], 'CYS': ['SG'],
+    'ASN': ['ND2'], 'GLN': ['NE2'], 'HIS': ['ND1', 'NE2'],
+    'LYS': ['NZ'], 'ARG': ['NE', 'NH1', 'NH2'],
+    'TRP': ['NE1'], 'ASP': [], 'GLU': [],
+    'MET': [], 'ALA': [], 'VAL': [], 'LEU': [], 'ILE': [], 'PHE': [], 'PRO': [], 'GLY': [],
+}
+ACCEPTOR_RES = {
+    'ASP': ['OD1', 'OD2'], 'GLU': ['OE1', 'OE2'],
+    'ASN': ['OD1'], 'GLN': ['OE1'],
+    'SER': ['OG'], 'THR': ['OG1'], 'TYR': ['OH'],
+    'HIS': ['ND1', 'NE2'], 'MET': ['SD'],
+}
+donors1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in DONOR_RES for a in r if a.get_name() in DONOR_RES.get(r.resname, [])]
+acceptors1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in ACCEPTOR_RES for a in r if a.get_name() in ACCEPTOR_RES.get(r.resname, [])]
+donors2 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain2_id] if r.resname in DONOR_RES for a in r if a.get_name() in DONOR_RES.get(r.resname, [])]
+acceptors2 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain2_id] if r.resname in ACCEPTOR_RES for a in r if a.get_name() in ACCEPTOR_RES.get(r.resname, [])]
+
+hbonds = []
+for d_tuple in donors1:
+    d, rd, cd = d_tuple
+    for a_tuple in acceptors2:
+        a, ra, ca = a_tuple
+        d_dist = float(d - a)
+        if d_dist <= HBOND_CUTOFF:
+            hbonds.append({
+                "type": "hbond",
+                "chain1": cd.id, "resno1": int(rd.id[1]), "resname1": rd.resname, "atom1": d.get_name(),
+                "chain2": ca.id, "resno2": int(ra.id[1]), "resname2": ra.resname, "atom2": a.get_name(),
+                "distance_A": round(d_dist, 2),
+            })
+for d_tuple in donors2:
+    d, rd, cd = d_tuple
+    for a_tuple in acceptors1:
+        a, ra, ca = a_tuple
+        d_dist = float(d - a)
+        if d_dist <= HBOND_CUTOFF:
+            hbonds.append({
+                "type": "hbond",
+                "chain1": cd.id, "resno1": int(rd.id[1]), "resname1": rd.resname, "atom1": d.get_name(),
+                "chain2": ca.id, "resno2": int(ra.id[1]), "resname2": ra.resname, "atom2": a.get_name(),
+                "distance_A": round(d_dist, 2),
+            })
+
+# ---- 3. Hydrophobic Contacts (C-C between hydrophobic residues, < 4.5Å) ----
+HYDROPHOBIC = {'ALA', 'VAL', 'LEU', 'ILE', 'MET', 'PHE', 'TRP', 'PRO'}
+HYDRO_CUTOFF = 4.5
+h1 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain1_id] if r.resname in HYDROPHOBIC for a in r if a.element == 'C']
+h2 = [(a, a.get_parent(), a.get_parent().get_parent()) for r in model[chain2_id] if r.resname in HYDROPHOBIC for a in r if a.element == 'C']
+
+hydrophobic = []
+seen_pairs = set()
+for a_tuple in h1:
+    a, ra, ca = a_tuple
+    for b_tuple in h2:
+        b, rb, cb = b_tuple
+        d = float(a - b)
+        if d <= HYDRO_CUTOFF:
+            key = tuple(sorted([(ra.resname + str(ra.id[1]) + ca.id), (rb.resname + str(rb.id[1]) + cb.id)]))
+            if key in seen_pairs:
+                continue
+            seen_pairs.add(key)
+            hydrophobic.append({
+                "type": "hydrophobic",
+                "chain1": ca.id, "resno1": int(ra.id[1]), "resname1": ra.resname, "atom1": a.get_name(),
+                "chain2": cb.id, "resno2": int(rb.id[1]), "resname2": rb.resname, "atom2": b.get_name(),
+                "distance_A": round(d, 2),
+            })
+
+all_interactions = salt_bridges + hbonds + hydrophobic
+all_interactions.sort(key=lambda x: x["distance_A"])
+
+print(json.dumps({
+    "chain1": chain1_id, "chain2": chain2_id,
+    "total": len(all_interactions),
+    "salt_bridges": len(salt_bridges),
+    "hbonds": len(hbonds),
+    "hydrophobic": len(hydrophobic),
+    "interactions": all_interactions,
+}, ensure_ascii=False, indent=2))
+`;
+    },
+  },
+  {
     id: "ramachandran",
     label: "Ramachandran 图 (φ/ψ 角)",
     description:

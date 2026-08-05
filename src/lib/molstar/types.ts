@@ -267,12 +267,38 @@ export interface MolstarPlugin {
       };
       [k: string]: unknown;
     };
+    /** Interaction props (clickFocus / clickCenterFocus / hoverHighlight). */
+    interaction?: {
+      props?: {
+        clickCenterFocus?: { isDisabled?: boolean; [k: string]: unknown };
+        clickFocus?: { isDisabled?: boolean; [k: string]: unknown };
+        hoverHighlight?: { isDisabled?: boolean; [k: string]: unknown };
+        [k: string]: unknown;
+      };
+      setProps?(propsOrFn: unknown): void;
+    };
+    setProps?(propsOrFn: unknown): void;
+    requestDraw?(): void;
+    /** Camera exposed to the measure overlay for 3D→2D projection. */
+    camera?: {
+      projectionView?: number[] | Float32Array | Float64Array;
+      viewport?: { width: number; height: number };
+      [k: string]: unknown;
+    };
   };
   events?: {
     interactivity?: {
       click?: { subscribe(cb: (v: unknown) => void): { unsubscribe(): void } };
       hover?: { subscribe(cb: (v: unknown) => void): { unsubscribe(): void } };
     };
+  };
+  /** Behavior subjects (the correct click event source). */
+  behaviors?: {
+    interaction?: {
+      click?: { subscribe(cb: (v: unknown) => void): { unsubscribe(): void } };
+      [k: string]: unknown;
+    };
+    [k: string]: unknown;
   };
 }
 

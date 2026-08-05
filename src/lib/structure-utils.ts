@@ -868,6 +868,46 @@ export function structureCentroid(pdb: string): { x: number; y: number; z: numbe
   return { x: sx / n, y: sy / n, z: sz / n };
 }
 
+/**
+ * Find the 3D coordinates of a single atom in a PDB string by matching
+ * chain / resno / resname / atomName. Used by interaction charts to draw
+ * distance lines between two atoms through the overlay canvas (Molstar's
+ * own addDistance draws to wrong points in some cases).
+ *
+ * Returns null if no matching ATOM/HETATM record is found.
+ */
+export function findAtomCoord(
+  pdbText: string,
+  opts: {
+    chain?: string;
+    resno?: number;
+    resname?: string;
+    atomName?: string;
+  }
+): { x: number; y: number; z: number } | null {
+  if (!pdbText) return null;
+  const lines = pdbText.split(/\r?\n/);
+  for (const line of lines) {
+    const rec = line.substring(0, 6).trim();
+    if (rec !== "ATOM" && rec !== "HETATM") continue;
+    const atomName = line.substring(12, 16).trim();
+    const resName = line.substring(17, 20).trim();
+    const chain = line.substring(21, 22).trim();
+    const resSeq = parseInt(line.substring(22, 26), 10);
+    if (Number.isNaN(resSeq)) continue;
+    if (opts.atomName && atomName !== opts.atomName) continue;
+    if (opts.resname && resName !== opts.resname) continue;
+    if (typeof opts.resno === "number" && resSeq !== opts.resno) continue;
+    if (opts.chain && chain !== opts.chain) continue;
+    const x = parseFloat(line.substring(30, 38));
+    const y = parseFloat(line.substring(38, 46));
+    const z = parseFloat(line.substring(46, 54));
+    if (Number.isNaN(x) || Number.isNaN(y) || Number.isNaN(z)) continue;
+    return { x, y, z };
+  }
+  return null;
+}
+
 export interface HBond {
   donorChain: string;
   donorResSeq: number;

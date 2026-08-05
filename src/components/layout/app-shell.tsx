@@ -13,6 +13,8 @@ import { ChatPanel } from "./chat-panel";
 import { ReportsPanel } from "./reports-panel";
 import { HistoryPanel } from "./history-panel";
 import { MolstarViewer } from "@/components/molstar/molstar-viewer";
+import { MeasureOverlay } from "@/components/molstar/measure-overlay";
+import { disableFocusBehaviors, clearAllMeasurementsAndFocus } from "@/lib/molstar/measure";
 import { useAppStore, selectActiveStructure, registerToast } from "@/lib/store";
 import { toast as sonnerToast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -110,6 +112,7 @@ export function AppShell() {
         commandLog={commandLog}
         structureInfo={structureInfo}
       />
+      <MeasureOverlay />
       <MeasureToolbar />
     </div>
   );
@@ -200,64 +203,66 @@ function MeasureToolbar() {
   const { t } = useLang();
   const pendingRef = useRef<unknown[]>([]);
   const [pendingCount, setPendingCount] = useState(0);
+  // Holds the cleanup function returned by disableFocusBehaviors (restores
+  // clickFocus/clickCenterFocus props + removes the semi-transparent
+  // ball-and-stick representation added for measure mode).
+  const restoreFocusRef = useRef<(() => void) | null>(null);
 
-  // When measure mode changes, set Molstar interactivity granularity + disable focus behavior.
+  // When measure mode changes, set Molstar interactivity granularity + disable
+  // focus behavior + add a semi-transparent ball-and-stick representation so
+  // the user can see individual atoms through the cartoon (借鉴 upload project).
   useEffect(() => {
     if (!viewer) return;
-    // Access the plugin via a non-hook path to avoid the immutability lint rule.
-    // The viewer is from the store, but we access its .plugin property directly.
-    const plugin = (viewer as unknown as { plugin: Record<string, unknown> }).plugin as any;
+    const plugin = viewer.plugin;
     if (!plugin?.managers?.interactivity) return;
 
     if (measureMode !== "off") {
       // Set granularity to element so clicks resolve to individual atoms.
       plugin.managers.interactivity.setProps({ granularity: "element" });
       // Clear any previous selection.
-      plugin.managers.structure.selection.clear();
-      plugin.managers.interactivity.lociSelects.deselectAll();
-      // Clear pending.
-      pendingRef.current = [];
-      setPendingCount(0);
+      try { plugin.managers.structure.selection.clear(); } catch {}
+      try { plugin.managers.interactivity.lociSelects.deselectAll(); } catch {}
+      // Clear pending. Resetting pendingCount here is necessary because
+      // entering measure mode invalidates any half-collected measurement;
+      // gated by length>0 to avoid a redundant render when already empty.
+      if (pendingRef.current.length > 0) {
+        pendingRef.current = [];
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setPendingCount(0);
+      }
 
-      // Disable the default click-focus behavior to prevent sidechain disappearing.
-      try {
-        const p = plugin;
-        if (p.managers?.interactivity?.props) {
-          /* eslint-disable react-hooks/immutability */
-          p._prevSelectionMode = p.selectionMode ?? false;
-          p.selectionMode = false;
-          /* eslint-enable react-hooks/immutability */
-        }
-        const canvas3d = p.canvas3d;
-        if (canvas3d?.interaction) {
-          p._prevInteractionProps = { ...canvas3d.interaction.props };
-          canvas3d.interaction.setProps({
-            ...canvas3d.interaction.props,
-            clickCenterFocus: { ...canvas3d.interaction.props?.clickCenterFocus, isDisabled: true },
-            clickFocus: { ...canvas3d.interaction.props?.clickFocus, isDisabled: true },
-          });
-        }
-      } catch (e) {
-        console.warn("Failed to disable focus behavior:", e);
-      }
+      // Disable clickFocus / clickCenterFocus (prevents sidechain disappearing)
+      // AND add a semi-transparent ball-and-stick overlay so atoms are visible.
+      disableFocusBehaviors(plugin)
+        .then((restore) => {
+          restoreFocusRef.current = restore;
+          try { plugin.canvas3d?.requestDraw?.(); } catch {}
+        })
+        .catch((e) => console.warn("Failed to disable focus behavior:", e));
     } else {
-      // Restore previous behavior when exiting measure mode.
-      try {
-        const p = plugin;
-        if (p._prevSelectionMode !== undefined) {
-          p.selectionMode = p._prevSelectionMode;
-          delete p._prevSelectionMode;
-        }
-        const canvas3d = p.canvas3d;
-        if (canvas3d?.interaction && p._prevInteractionProps) {
-          canvas3d.interaction.setProps(p._prevInteractionProps);
-          delete p._prevInteractionProps;
-        }
-      } catch (e) {
-        console.warn("Failed to restore focus behavior:", e);
+      // Exiting measure mode: restore focus behavior + remove the
+      // semi-transparent ball-and-stick representation.
+      const restore = restoreFocusRef.current;
+      if (restore) {
+        try { restore(); } catch (e) { console.warn("restore focus failed:", e); }
+        restoreFocusRef.current = null;
       }
+      // Also clear interaction overlay lines + any lingering measurements
+      // so the viewer returns to a clean state.
+      try { clearAllMeasurementsAndFocus(plugin); } catch {}
     }
   }, [viewer, measureMode]);
+
+  // Cleanup on unmount.
+  useEffect(() => {
+    return () => {
+      const restore = restoreFocusRef.current;
+      if (restore) {
+        try { restore(); } catch {}
+        restoreFocusRef.current = null;
+      }
+    };
+  }, []);
 
   // Subscribe to Molstar click events when in measure mode.
   // Molstar's click event is at plugin.behaviors.interaction.click (NOT plugin.events.interactivity.click).
