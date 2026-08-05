@@ -161,6 +161,29 @@ export function InteractionNetwork() {
             dashed: true,
           },
         ]);
+
+        // Focus the camera on the midpoint of the two atoms so the user
+        // actually sees the interaction being drawn. We use focusSphere with
+        // a modest radius (distance between atoms + 8Å padding) — a single
+        // call after clearInteractionState does NOT lock the camera (the
+        // earlier "camera lock" bug was from multiple focusSphere calls in
+        // a chain, which we no longer do). Molstar's Vec3 is a [x,y,z] tuple.
+        try {
+          const mid = [
+            (coord1.x + coord2.x) / 2,
+            (coord1.y + coord2.y) / 2,
+            (coord1.z + coord2.z) / 2,
+          ];
+          const dist = Math.sqrt(
+            (coord2.x - coord1.x) ** 2 +
+            (coord2.y - coord1.y) ** 2 +
+            (coord2.z - coord1.z) ** 2
+          );
+          const radius = Math.max(12, dist + 8);
+          plugin.managers.camera.focusSphere({ center: mid, radius });
+        } catch (e) {
+          console.warn("[handleFocusInteraction] camera focus failed:", e);
+        }
       }
 
       plugin.canvas3d?.requestDraw?.();

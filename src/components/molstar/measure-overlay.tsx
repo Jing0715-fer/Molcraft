@@ -264,8 +264,15 @@ export function MeasureOverlay() {
       const viewport = { width: vp.width, height: vp.height };
 
       // Draw completed measurements.
+      // NOTE: the current store's `measurements` entries only carry
+      // {id, mode, label, detail, ts} — they do NOT include atom coords
+      // (Molstar's native measurement manager draws those in 3D). So we
+      // skip the overlay rendering for measurements and only draw the
+      // `interactionLines` below, which DO carry explicit 3D coords.
       for (const m of measurements as MeasureItem[]) {
-        const projected = m.atoms.map((a) =>
+        const atoms = (m as unknown as { atoms?: MeasureAtom[] }).atoms;
+        if (!atoms || atoms.length === 0) continue;
+        const projected = atoms.map((a) =>
           project3DTo2D([a.x, a.y, a.z], pv, viewport)
         );
 
