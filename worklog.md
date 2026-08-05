@@ -2254,3 +2254,25 @@ Stage Summary:
   2. ✅ Measure mode: semi-transparent ball-and-stick (alpha=0.5) auto-added on enter, auto-removed on exit
 - No regressions: lint clean, dev server stable, all 24 existing charts + APBS/druggability/screening/pocket features intact.
 - measure-overlay.tsx also enables dashed distance-line drawing for water-bridges/disulfide/metal charts (they call setInteractionLines).
+
+---
+Task ID: MIGRATE-FIX-1
+Agent: main (Z.ai Code)
+Task: Fix two bugs reported after the 500caa0 migration (measure-overlay crash + interaction click no focus)
+
+Work Log:
+- **Bug 1: TypeError at measure-overlay.tsx:268** (`m.atoms.map is not a function`):
+  - Root cause: the current store's `measurements` entries only carry `{id, mode, label, detail, ts}` — NO `atoms` field (Molstar's native measurement manager draws distances in 3D). The 500caa0 overlay code assumed `m.atoms` existed.
+  - Fix: guard the measurements loop with `const atoms = (m as ...).atoms; if (!atoms || atoms.length === 0) continue;`. Only `interactionLines` (which DO carry explicit 3D coords) are drawn by the overlay.
+
+- **Bug 2: interaction click draws line but no camera focus**:
+  - Root cause: 500caa0 had removed all `focusSphere` calls (commit c8d179b: "remove focusSphere (caused camera lock)") — but that lock was from MULTIPLE chained focusSphere calls (2 residues + water). A single call is safe.
+  - Fix: added one `plugin.managers.camera.focusSphere({ center: [mx,my,mz], radius })` call in `handleFocusInteraction`, on the midpoint of the two atoms. Radius = atom distance + 8Å (min 12Å). Note: Molstar's Vec3 is a `[x,y,z]` tuple, NOT a `{x,y,z}` object — initial attempt used the wrong shape and silently failed.
+
+E2E verification (4HHB A↔B, agent-browser):
+- Measure mode: entered distance mode, semi-transparent ball-and-stick rendered, 0 TypeError in dev.log (was crashing before). Exited cleanly (reps auto-removed).
+- Interaction click: clicked "画线" on ARG31(A)↔GLN127(B) → interactionLines=1 (label "2.81 Å"), camera moved from [10.7,12.6,143.5] → [24.8,7.2,89.1] (focused on midpoint), 0 console errors.
+
+Stage Summary:
+- Both bugs fixed, E2E-verified, pushed to GitHub (commit 80f7605).
+- remote main: 80f7605 | local HEAD: 80f7605
