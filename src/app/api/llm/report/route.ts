@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
-import ZAI from "z-ai-web-dev-sdk";
 import { fetchFullMetadata, metadataToMarkdown } from "@/lib/rcsb-client";
+import { chatWithSession, type LlmMessage } from "@/lib/llm/dispatch";
 
 export const runtime = "nodejs";
-export const maxDuration = 90;
+export const maxDuration = 300;  // 5 min for full structure analysis
 
 interface ReportRequestBody {
   /** Existing analysis notes the user/assistant already produced. */
@@ -16,6 +16,12 @@ interface ReportRequestBody {
   extraInstructions?: string;
   /** If true, auto-fetch RCSB metadata for the first structure (real data). */
   fetchRealData?: boolean;
+  /** Optional LLM provider override — "glm" (default) | "cli:hermes" | "cli:codex" | ... */
+  provider?: string;
+  /** Optional project/structure id to scope session reuse and history. */
+  projectId?: string;
+  /** Anonymous userId when no auth is wired. */
+  userId?: string;
 }
 
 const REPORT_SYSTEM_PROMPT = `你是一名专业的结构生物学报告撰写助手。给定真实的结构分析数据（来自 RCSB Data API：分辨率、链组成、序列、配体、组装体埋藏表面积 BSA、界面残基及每个残基的 BSA 贡献）、分析笔记，以及（可选）一张视口截图，请撰写一份结构化的中文 Markdown 深度分析报告。
@@ -49,7 +55,6 @@ export async function POST(req: NextRequest) {
     if (body.fetchRealData && body.structures.length > 0) {
       const first = body.structures[0];
       const id = first.id;
-      // Only fetch if it looks like a 4-char PDB ID
       if (/^[a-zA-Z0-9]{4}$/.test(id)) {
         try {
           const data = await fetchFullMetadata(id, true);
@@ -80,23 +85,43 @@ ${body.snapshot ? "# 视口截图\n（已附 PNG 图像）" : ""}
 ${body.extraInstructions ? `# 额外要求\n${body.extraInstructions}` : ""}
 `.trim();
 
-    const zai = await ZAI.create();
-    const completion = await zai.chat.completions.create({
-      messages: [
-        { role: "assistant", content: REPORT_SYSTEM_PROMPT },
-        { role: "user", content: userContent },
-      ],
-      temperature: 0.4,
-      max_tokens: 3000,
-      thinking: { type: "disabled" },
-    });
+    const messages: LlmMessage[] = [
+      { role: "system", content: REPORT_SYSTEM_PROMPT },
+      { role: "user", content: userContent },
+    ];
 
-    const markdown = completion.choices[0]?.message?.content ?? "";
+    const result = await chatWithSession(
+      body.userId || "default",
+      "report",
+      messages,
+      {
+        // See chat/route.ts for the same reasoning: don't pre-fill
+        // "glm" here or fallback is disabled.
+        provider: body.provider || undefined,
+        projectId: body.projectId || body.structures[0]?.id,
+        persistHistory: true,
+      }
+    );
+
+    if (!result.ok) {
+      return NextResponse.json(
+        {
+          error: "报告生成失败",
+          detail: result.error,
+          provider: result.provider,
+          fallback: result.fallback,
+        },
+        { status: 500 }
+      );
+    }
 
     return NextResponse.json({
-      markdown,
+      markdown: result.content,
       realDataFetched: Boolean(realDataMarkdown),
-      usage: completion.usage,
+      usage: result.usage,
+      provider: result.provider,
+      model: result.model,
+      fallback: result.fallback,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

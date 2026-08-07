@@ -395,14 +395,22 @@ export const SYSTEM_PROMPT = `你是一名结构生物学专家助手 "MolCraft 
 
 /** Build the chat history for the LLM. */
 export function buildMessages(
-  history: Array<{ role: "user" | "assistant"; content: string }>,
+  history: Array<{ role: "user" | "assistant" | "system"; content: string }>,
   context?: {
     loadedStructures?: Array<{ id: string; label?: string }>;
     currentSelection?: string;
   }
 ) {
+  // CRITICAL: the system prompt MUST be sent with role:"system". An earlier
+  // version used role:"assistant" (a common LLM-API mistake when the
+  // backend treats every message as a turn) — that caused the 4万-token
+  // instruction to be conflated with the assistant's prior output, so on
+  // resume the model thought "I just said all these rules" and answered
+  // with a single "?". dispatch.ts keys off role:"system" to find the
+  // system prompt; if it's missing the whole thing gets inlined into the
+  // user turn and breaks context.
   const system = {
-    role: "assistant" as const,
+    role: "system" as const,
     content: SYSTEM_PROMPT,
   };
 
@@ -416,8 +424,8 @@ export function buildMessages(
       }
     : null;
 
-  const messages = [system];
+  const messages: Array<{ role: "system" | "user" | "assistant"; content: string }> = [system];
   if (contextMsg) messages.push(contextMsg);
-  messages.push(...history);
+  messages.push(...history.filter((m) => m.role !== "system")); // ignore any client-side system messages
   return messages;
 }

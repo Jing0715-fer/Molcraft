@@ -30,3 +30,53 @@ model Post {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 }
+
+/// User's currently-selected LLM provider. There is at most one row per
+/// (userId, scope) where scope is "chat" | "report" | "vlm".
+model LLMConfig {
+  id        String   @id @default(cuid())
+  userId    String
+  scope     String   // "chat" | "report" | "vlm"
+  provider  String   // "glm" | "cli:hermes" | "cli:codex" | ...
+  model     String?  // optional explicit model override
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+
+  @@unique([userId, scope])
+  @@index([userId])
+}
+
+/// Per-(user, scope) persistent CLI session id so multi-turn calls can
+/// resume the same remote conversation. Keyed by (userId, scope, provider)
+/// because a given user might switch provider mid-project and the new
+/// provider won't have a session to resume.
+model LLMSession {
+  id            String   @id @default(cuid())
+  userId        String
+  scope         String   // "chat" | "report" | "vlm"
+  provider      String   // matches LLMConfig.provider
+  cliSessionId  String   // the value passed to --resume
+  lastUsedAt    DateTime @default(now())
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([userId, scope, provider])
+  @@index([userId, scope])
+}
+
+/// A single user/assistant turn in a scoped conversation. Used to build
+/// the message array the LLM sees, and to preserve history across reloads
+/// (browser cache can be cleared but the server still has the turns).
+model ConversationTurn {
+  id        String   @id @default(cuid())
+  userId    String
+  scope     String
+  projectId String?  // optional project/structure id this turn belongs to
+  role      String   // "user" | "assistant" | "system"
+  content   String
+  provider  String?  // which provider produced the assistant turn
+  model     String?
+  createdAt DateTime @default(now())
+
+  @@index([userId, scope, projectId, createdAt])
+}

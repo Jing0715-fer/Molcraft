@@ -1,95 +1,51 @@
-import { NextResponse } from "next/server";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
+import { NextRequest, NextResponse } from "next/server";
+import { inspectProviders } from "@/lib/llm/dispatch";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-/** LLM agent CLI definitions — inspired by the reference repo's CLI_ADAPTERS pattern. */
-const AGENT_ADAPTERS = [
-  {
-    id: "glm",
-    label: "GLM (Z.ai)",
-    description: "Z.ai GLM 大语言模型 — 默认后端，通过 z-ai-web-dev-sdk 调用",
-    bin: "python3", // always available — uses SDK not CLI
-    alwaysAvailable: true,
-  },
-  {
-    id: "claude",
-    label: "Claude CLI",
-    description: "Anthropic Claude 命令行工具 — 需安装 claude CLI 并配置 API key",
-    bin: "claude",
-  },
-  {
-    id: "codex",
-    label: "Codex CLI",
-    description: "OpenAI Codex 命令行工具 — 需安装 codex CLI 并配置 API key",
-    bin: "codex",
-  },
-  {
-    id: "gemini",
-    label: "Gemini CLI",
-    description: "Google Gemini 命令行工具 — 需安装 gemini CLI 并配置 API key",
-    bin: "gemini",
-  },
-  {
-    id: "aider",
-    label: "Aider",
-    description: "Aider AI pair programmer — 开源 AI 编程助手，支持多种 LLM 后端",
-    bin: "aider",
-  },
-  {
-    id: "hermes",
-    label: "Hermes CLI",
-    description: "Hermes AI agent — 多模型路由 CLI，支持工具调用与代码执行",
-    bin: "hermes",
-  },
-  {
-    id: "codebuddy",
-    label: "CodeBuddy",
-    description: "CodeBuddy CLI — 腾讯云 AI 代码助手，支持代码生成与分析",
-    bin: "codebuddy",
-  },
-  {
-    id: "cursor",
-    label: "Cursor",
-    description: "Cursor AI — AI 代码编辑器（如已安装）",
-    bin: "cursor",
-  },
-];
-
-async function checkBin(bin: string): Promise<boolean> {
+/**
+ * GET /api/llm/agents — detects available LLM agent CLIs and SDKs.
+ *
+ * Query params:
+ *   ?all=1           — include unavailable entries (UI shows them dimmed)
+ *   ?whitelist=a,b   — restrict to that subset of provider ids
+ *
+ * Returns the union of:
+ *   - Z.ai SDK (provider="glm") — always listed, available if SDK installed
+ *   - CLI candidates: cli:hermes, cli:codex, cli:claude, cli:codebuddy,
+ *                     cli:gemini, cli:aider
+ */
+export async function GET(request: NextRequest) {
   try {
-    await execFileAsync("which", [bin], { timeout: 3000 });
-    return true;
-  } catch {
-    return false;
-  }
-}
+    const url = new URL(request.url);
+    const showUnavailable = url.searchParams.get("all") === "1";
+    const whitelist = url.searchParams
+      .get("whitelist")
+      ?.split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-/** GET /api/llm/agents — detects available LLM agent CLIs. */
-export async function GET() {
-  try {
-    const agents = await Promise.all(
-      AGENT_ADAPTERS.map(async (a) => {
-        const available = a.alwaysAvailable
-          ? true
-          : await checkBin(a.bin);
-        return {
-          id: a.id,
-          label: a.label,
-          description: a.description,
-          available,
-          bin: a.bin,
-        };
-      })
-    );
+    const result = await inspectProviders({ showUnavailable, whitelist });
+
+    // Map each provider record to also expose `id` (the CLI short name,
+    // e.g. "hermes", "codex", "glm") for backwards compat with the
+    // existing chat-panel UI that reads `a.id`. `provider` keeps the
+    // canonical form ("cli:hermes" / "glm" / "zai") for new callers.
+    const agents = result.available.map((p) => {
+      const shortId = p.provider.startsWith("cli:")
+        ? p.provider.slice("cli:".length)
+        : p.provider; // "glm" stays "glm"
+      return {
+        ...p,
+        id: shortId,
+      };
+    });
 
     return NextResponse.json({
       agents,
-      default: "glm",
+      default: result.chosen,
+      totalClisScanned: result.totalClisScanned,
     });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -98,4 +54,14 @@ export async function GET() {
       { status: 500 }
     );
   }
+}
+
+/**
+ * POST /api/llm/agents — clear the probe cache so the next GET re-scans PATH.
+ * Used by the settings UI "redetect" button.
+ */
+export async function POST() {
+  const { clearLlmProbeCache } = await import("@/lib/llm/dispatch");
+  clearLlmProbeCache();
+  return NextResponse.json({ ok: true, message: "probe cache cleared" });
 }

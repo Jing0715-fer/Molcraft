@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import ZAI from "z-ai-web-dev-sdk";
+import { vlmChat, type LlmMessage } from "@/lib/llm/dispatch";
 
 export const runtime = "nodejs";
 export const maxDuration = 60;
@@ -7,6 +7,10 @@ export const maxDuration = 60;
 interface VlmChatBody {
   prompt: string;
   image: string; // data URL (base64) or http URL
+  /** Optional LLM provider override. Only "glm"/"zai" supports vision today. */
+  provider?: string;
+  projectId?: string;
+  userId?: string;
 }
 
 /**
@@ -31,26 +35,31 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const zai = await ZAI.create();
+    const messages: LlmMessage[] = [{ role: "user", content: body.prompt }];
 
-    const completion = await zai.chat.completions.createVision({
-      model: "glm-5v-turbo",
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "text", text: body.prompt },
-            { type: "image_url", image_url: { url: body.image } },
-          ],
-        },
-      ],
-      thinking: { type: "disabled" },
+    const result = await vlmChat(body.userId || "default", messages, {
+      provider: body.provider || "glm",
+      image: body.image,
+      projectId: body.projectId,
+      persistHistory: false, // vision calls are ephemeral verifications
     });
 
-    const content =
-      completion.choices?.[0]?.message?.content ?? "";
+    if (!result.ok) {
+      return NextResponse.json(
+        {
+          error: "VLM 调用失败",
+          detail: result.error,
+          provider: result.provider,
+        },
+        { status: 500 }
+      );
+    }
 
-    return NextResponse.json({ content });
+    return NextResponse.json({
+      content: result.content,
+      provider: result.provider,
+      model: result.model,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error("[/api/vlm/chat] error:", msg);

@@ -190,6 +190,9 @@ export function ChatPanel() {
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
                   messages: history,
+                  provider: activeCli === "glm" ? "glm" : `cli:${activeCli}`,
+                  projectId: structures[0]?.id,
+                  userId: "default",
                   context: {
                     loadedStructures: structures.map((s) => ({
                       id: s.id,
